@@ -9,3 +9,17 @@ kvproto = { git = "https://github.com/busyjay/kvproto", branch = "release-5.0-mi
 grpcio = "0.9.0"
 raft = "0.6.0"
 protobuf = "2.7.0"
+rocksdb = { git = "https://github.com/busyjay/rust-rocksdb", branch = "tikv-5.0-mini-pd" }
+thiserror = "1.0"
+rand = "0.8"
+futures = "0.3"
+slog = "2.0"
+futures-timer = "3.0"
+yatp = { git = "https://github.com/tikv/yatp" }
+bytes = "1.0"
+crossbeam = "0.8"
+parking_lot = "0.11"
+sloggers = "2.0"
+
+[dev-dependencies]
+tempdir = "0.3"
