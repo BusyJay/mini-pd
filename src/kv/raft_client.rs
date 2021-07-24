@@ -29,6 +29,7 @@ impl Connection {
             let addr = match addr_opt {
                 Some(a) => a,
                 None => {
+                    error!(self.logger, "failed to resolve address of {}", self.id);
                     // backoff.
                     Delay::new(Duration::from_secs(1)).await;
                     if let Ok(None) = self.msgs.try_next() {

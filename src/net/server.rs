@@ -55,6 +55,9 @@ impl Server {
                 .build(),
         );
         let remote = self.pool.remote();
+        self.address_map
+            .lock()
+            .insert(self.config.my_id, self.config.advertise_address.clone());
         let raft_client = RaftClient::new(
             raft_env.clone(),
             self.address_map.clone(),

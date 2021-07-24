@@ -1,5 +1,8 @@
+use super::storage::RockSnapshot;
 use bytes::Bytes;
+use futures::channel::mpsc::Sender;
 use raft::eraftpb::Message;
+use std::fmt::{self, Debug};
 
 pub enum Command {
     Put { key: Bytes, value: Bytes },
@@ -53,11 +56,40 @@ impl Command {
     }
 }
 
+pub enum Res {
+    Success,
+    Snapshot(RockSnapshot),
+    Leader(u64),
+    Fail(String),
+}
+
+impl Debug for Res {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Res::Success => write!(formatter, "Res::Success"),
+            Res::Snapshot(_) => write!(formatter, "Res::Snapshot"),
+            Res::Leader(id) => write!(formatter, "Res::Leader({})", id),
+            Res::Fail(s) => write!(formatter, "Res::Fail({:?})", s),
+        }
+    }
+}
+
 pub enum Msg {
-    Command(Command),
+    Command {
+        cmd: Command,
+        notifier: Option<Sender<Res>>,
+    },
+    Snapshot(Sender<Res>),
+    WaitTillLeader(Sender<Res>),
     RaftMessage(Message),
     Tick,
     Stop,
+}
+
+impl Msg {
+    pub fn command(cmd: Command, notifier: Option<Sender<Res>>) -> Msg {
+        Msg::Command { cmd, notifier }
+    }
 }
 
 fn put_proposal(key: &[u8], val: Bytes) -> Vec<u8> {

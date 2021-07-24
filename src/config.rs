@@ -10,6 +10,8 @@ pub struct Config {
     pub initial_peers: Vec<u64>,
     pub initial_address_book: HashMap<u64, String>,
     pub log_file: String,
+    pub raft_election_ticks: usize,
+    pub raft_heartbeat_ticks: usize,
     // Force user to use ..Default::default().
     _preserved: PhantomData<()>,
 }
@@ -24,6 +26,8 @@ impl Default for Config {
             initial_peers: vec![],
             initial_address_book: HashMap::new(),
             log_file: "pd.log".to_owned(),
+            raft_election_ticks: 20,
+            raft_heartbeat_ticks: 2,
             _preserved: PhantomData,
         }
     }

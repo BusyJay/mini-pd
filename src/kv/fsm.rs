@@ -1,12 +1,14 @@
 use super::storage::{self, address_key, valid_data_key};
-use super::{Command, InvokeContext, Msg, RaftClient, RockStorage};
+use super::{Command, InvokeContext, Msg, RaftClient, Res, RockStorage};
 use crate::{r, Config, Result};
 use crossbeam::channel::{self, Receiver, RecvTimeoutError, Sender};
+use futures::channel::mpsc;
 use futures_timer::Delay;
 use raft::eraftpb::{Entry, Message};
-use raft::prelude::*;
+use raft::{prelude::*, INVALID_ID};
 use rocksdb::{ReadOptions, SeekKey, Writable, WriteBatch, DB};
 use slog::{info, o, Logger};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::TryInto;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +17,17 @@ use yatp::task::future::TaskCell;
 use yatp::Remote;
 
 const SYNC_INTERVAL: Duration = Duration::from_micros(100);
+
+struct Proposal {
+    index: u64,
+    term: u64,
+    notifier: mpsc::Sender<Res>,
+}
+
+struct ReadRequest {
+    notifier: mpsc::Sender<Res>,
+    start: Instant,
+}
 
 pub struct Fsm {
     node: RawNode<RockStorage>,
@@ -32,6 +45,12 @@ pub struct Fsm {
     last_ready_number: u64,
     last_sync_time: Instant,
     raft_client: RaftClient,
+    proposal_queue: VecDeque<Proposal>,
+    // ReadIndex don't have order, and can easily lose, use `HashMap`
+    // for simplicity.
+    read_states: HashMap<u64, ReadRequest>,
+    read_queue: BTreeMap<u64, Vec<mpsc::Sender<Res>>>,
+    role_observer: Vec<mpsc::Sender<Res>>,
 }
 
 impl Fsm {
@@ -68,12 +87,15 @@ impl Fsm {
         let cfg = raft::Config {
             id: storage.id(),
             applied: storage.applied(),
+            pre_vote: true,
+            election_tick: config.raft_election_ticks,
+            heartbeat_tick: config.raft_heartbeat_ticks,
             ..Default::default()
         };
         let node = RawNode::new(&cfg, storage, logger)?;
         let logger = logger.new(o! {"fsm_id" => node.store().id()});
         let (tx, rx) = channel::bounded(4096);
-        let fsm = Fsm {
+        let mut fsm = Fsm {
             node,
             receiver: rx,
             sender: tx,
@@ -89,9 +111,22 @@ impl Fsm {
             persisted_messages: Vec::with_capacity(4096),
             last_ready_number: 0,
             last_sync_time: Instant::now(),
+            proposal_queue: VecDeque::with_capacity(4096),
+            read_states: HashMap::with_capacity(4097),
+            read_queue: BTreeMap::new(),
+            role_observer: vec![],
         };
-        fsm.load_address_map();
+        fsm.on_start();
         Ok(fsm)
+    }
+
+    fn on_start(&mut self) {
+        self.load_address_map();
+        self.schedule_tick();
+
+        if self.node.store().singleton() {
+            let _ = self.node.campaign();
+        }
     }
 
     fn load_address_map(&self) {
@@ -128,18 +163,66 @@ impl Fsm {
         });
     }
 
-    fn process(&mut self, msg: Msg) {
+    fn get_notifier(&mut self, index: u64, term: u64) -> Option<mpsc::Sender<Res>> {
+        loop {
+            let front = match self.proposal_queue.front() {
+                Some(p) => p,
+                None => return None,
+            };
+            if front.term < term {
+                self.proposal_queue.pop_front();
+                continue;
+            } else if front.term > term || front.index > index {
+                return None;
+            }
+            assert_eq!(front.index, index, "{}", term);
+            return self.proposal_queue.pop_front().map(|p| p.notifier);
+        }
+    }
+
+    fn process(&mut self, start: Instant, msg: Msg) {
         match msg {
-            Msg::Command(c) => {
-                let (context, data) = c.into_proposal();
+            Msg::Command { cmd, notifier } => {
+                let (context, data) = cmd.into_proposal();
                 match self.node.propose(context, data) {
-                    Ok(()) => self.has_ready = true,
-                    Err(e) => info!(self.logger, "failed to make propose {}", e),
+                    Ok(()) => {
+                        self.has_ready = true;
+                        if let Some(notifier) = notifier {
+                            self.proposal_queue.push_back(Proposal {
+                                term: self.node.raft.term,
+                                index: self.node.raft.raft_log.last_index(),
+                                notifier,
+                            })
+                        }
+                    }
+                    Err(e) => {
+                        let err_msg = format!("failed to make proposal: {}", e);
+                        info!(self.logger, "{}", err_msg);
+                        if let Some(mut notifier) = notifier {
+                            let _ = notifier.try_send(Res::Fail(err_msg));
+                        }
+                    }
+                }
+            }
+            Msg::Snapshot(notifier) => {
+                // This is not technically safe, should use uuid.
+                let state: u64 = rand::random();
+                self.node.read_index(state.to_ne_bytes().to_vec());
+                self.read_states
+                    .insert(state, ReadRequest { notifier, start });
+            }
+            Msg::WaitTillLeader(mut notifier) => {
+                let leader_id = self.node.raft.leader_id;
+                if leader_id != 0 {
+                    let _ = notifier.try_send(Res::Leader(leader_id));
+                } else {
+                    self.role_observer.push(notifier);
                 }
             }
             Msg::RaftMessage(msg) => {
                 if let Err(e) = self.node.step(msg) {
                     info!(self.logger, "failed to step message {}", e);
+                } else {
                     self.has_ready = true;
                 }
             }
@@ -156,21 +239,30 @@ impl Fsm {
         for mut entry in entries {
             let context = entry.take_context();
             let data = entry.take_data();
-            match Command::from_proposal(context, data) {
-                None => continue,
+            let index = entry.get_index();
+            let term = entry.get_term();
+            let res = match Command::from_proposal(context, data) {
+                None => Res::Success,
                 Some(Command::Put { key, value }) => {
                     if valid_data_key(&key) {
                         if let Err(e) = self.write_batch.put(&*key, &*value) {
                             panic!("unable to apply command: {:?}", e);
                         }
+                        Res::Success
+                    } else {
+                        Res::Fail(format!("invalid key {:?}", key))
                     }
                 }
                 Some(Command::UpdateAddress { id, address }) => {
                     if let Err(e) = self.write_batch.put(&address_key(id), address.as_bytes()) {
-                        panic!("unable to write address at {}: {}", entry.get_index(), e);
+                        panic!("unable to write address at {}: {}", index, e);
                     }
                     self.raft_client.address_map().lock().insert(id, address);
+                    Res::Success
                 }
+            };
+            if let Some(mut notifier) = self.get_notifier(index, term) {
+                let _ = notifier.try_send(res);
             }
         }
         applied_index
@@ -178,20 +270,55 @@ impl Fsm {
 
     fn send_messages(&mut self, msgs: Vec<Message>) {
         for msg in msgs {
+            info!(self.logger, "sending {:?}", msg);
             self.raft_client.send(msg);
         }
     }
 
-    fn process_read(&mut self, _read_states: Vec<ReadState>) {
-        // We don't use read index yet.
+    fn process_read(&mut self, read_states: Vec<ReadState>) {
+        for read in read_states {
+            let id = u64::from_ne_bytes(read.request_ctx.try_into().unwrap());
+            if let Some(mut req) = self.read_states.remove(&id) {
+                if read.index <= self.node.store().applied() {
+                    let _ = req
+                        .notifier
+                        .try_send(Res::Snapshot(self.node.store().rock_snapshot()));
+                }
+                self.read_queue
+                    .entry(read.index)
+                    .or_default()
+                    .push(req.notifier);
+            }
+        }
     }
 
-    fn process_ready(&mut self) -> Result<()> {
-        self.has_ready = false;
+    fn clean_stale_read_req(&mut self, start: Instant) {
+        self.read_states.retain(|_, v| {
+            if start
+                .checked_duration_since(v.start)
+                .map_or(false, |d| d > Duration::from_secs(10))
+            {
+                let _ = v.notifier.try_send(Res::Fail("timeout".to_owned()));
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn notify_role_changed(&mut self) {
+        if self.node.raft.leader_id != INVALID_ID && !self.role_observer.is_empty() {
+            for mut ob in self.role_observer.drain(..) {
+                let _ = ob.try_send(Res::Leader(self.node.raft.leader_id));
+            }
+        }
+    }
+
+    fn process_ready(&mut self, start: Instant) -> Result<()> {
         let mut sync_log = false;
-        let before_ready = Instant::now();
-        if self.node.has_ready() {
+        if self.has_ready && self.node.has_ready() {
             let mut ready = self.node.ready();
+            self.notify_role_changed();
             let applied_index = if !ready.committed_entries().is_empty() {
                 Some(self.handle_committed_entries(ready.take_committed_entries()))
             } else {
@@ -203,6 +330,7 @@ impl Fsm {
             if !ready.read_states().is_empty() {
                 self.process_read(ready.take_read_states());
             }
+            self.clean_stale_read_req(start);
             self.last_ready_number = ready.number();
             let mut context = InvokeContext::new(self.node.store());
             if let Some(index) = applied_index {
@@ -211,16 +339,29 @@ impl Fsm {
             self.node
                 .mut_store()
                 .process_ready(&mut context, &mut ready, &mut self.write_batch)?;
-            sync_log |= ready.must_sync();
-            self.unsynced_data_size += self.write_batch.data_size() as u64;
-            r!(self.db.write(&self.write_batch));
-            self.write_batch.clear();
+            if !self.write_batch.is_empty() {
+                sync_log |= ready.must_sync();
+                self.unsynced_data_size += self.write_batch.data_size() as u64;
+                r!(self.db.write(&self.write_batch));
+            }
             self.node.mut_store().post_ready(context);
+            if !ready.persisted_messages().is_empty() {
+                // Actually we don't have to check persisted_messages as raft-rs is
+                // expected to tolerate with out of order messages.
+                if self.write_batch.is_empty() && self.persisted_messages.is_empty() {
+                    self.send_messages(ready.take_persisted_messages());
+                } else {
+                    self.persisted_messages
+                        .push(ready.take_persisted_messages());
+                }
+            }
+            self.write_batch.clear();
             self.node.advance_append_async(ready);
         }
+        self.has_ready = false;
         if self.unsynced_data_size >= 512 * 1024
             || self.unsynced_data_size > 0
-                && before_ready
+                && start
                     .checked_duration_since(self.last_sync_time)
                     .map_or(false, |d| d >= SYNC_INTERVAL)
         {
@@ -229,7 +370,7 @@ impl Fsm {
         if sync_log {
             r!(self.db.sync_wal());
             let after_sync = Instant::now();
-            if let Some(d) = after_sync.checked_duration_since(before_ready) {
+            if let Some(d) = after_sync.checked_duration_since(start) {
                 if d >= Duration::from_millis(100) {
                     info!(self.logger, "syncing WAL takes {:?}", d);
                 }
@@ -248,7 +389,9 @@ impl Fsm {
     }
 
     fn suggest_timeout(&self) -> Option<Duration> {
-        if self.unsynced_data_size > 0 {
+        // Need sync for unsynced data or may need to handle committed entries
+        // if sync has just happened.
+        if self.unsynced_data_size > 0 || self.has_ready {
             Some(
                 match Instant::now().checked_duration_since(self.last_sync_time) {
                     Some(dur) if dur < SYNC_INTERVAL => SYNC_INTERVAL - dur,
@@ -275,8 +418,9 @@ impl Fsm {
                     Err(_) => return Ok(()),
                 }
             };
+            let start = Instant::now();
             while let Some(m) = msg {
-                self.process(m);
+                self.process(start, m);
                 if self.abort {
                     return Ok(());
                 }
@@ -288,9 +432,7 @@ impl Fsm {
                 }
                 msg = self.receiver.try_recv().ok();
             }
-            if self.has_ready {
-                self.process_ready()?;
-            }
+            self.process_ready(start)?;
             timeout = self.suggest_timeout();
         }
     }

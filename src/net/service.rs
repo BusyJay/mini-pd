@@ -246,8 +246,8 @@ impl Pd for PdService {
 #[derive(Clone)]
 pub struct RaftService {
     id: u64,
-    logger: Logger,
     sender: crossbeam::channel::Sender<Msg>,
+    logger: Logger,
 }
 
 impl RaftService {

@@ -6,7 +6,7 @@ use protobuf::Message;
 use raft::eraftpb::{ConfState, Entry, Snapshot};
 use raft::prelude::*;
 use raft::{Error, Result, StorageError};
-use rocksdb::{DBOptions, Writable, WriteBatch, DB};
+use rocksdb::{DBOptions, Writable, WriteBatch, WriteOptions, DB};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -133,6 +133,7 @@ pub fn bootstrap(
 
     let mut raft_state = RaftLocalState::default();
     raft_state.mut_hard_state().set_term(init_term);
+    raft_state.mut_hard_state().set_commit(init_index);
     raft_state.set_last_index(init_index);
     r!(wb.put(RAFT_STATE_KEY, &raft_state.write_to_bytes().unwrap()));
 
@@ -155,12 +156,16 @@ pub fn bootstrap(
         r!(wb.put(&address_key(*id), address.as_bytes()));
     }
 
-    r!(db.sync_wal());
+    let mut write_opts = WriteOptions::default();
+    write_opts.set_sync(true);
+    r!(db.write_opt(&wb, &write_opts));
 
     guard.0 = false;
 
     Ok(())
 }
+
+pub type RockSnapshot = rocksdb::rocksdb::Snapshot<Arc<DB>>;
 
 /// Returned by `RockStorage::handle_raft_ready`, used for recording changed status of
 /// `RaftLocalState` and `RaftApplyState`.
@@ -239,8 +244,17 @@ impl RockStorage {
         self.db.clone()
     }
 
+    pub fn rock_snapshot(&self) -> RockSnapshot {
+        RockSnapshot::new(self.db.clone())
+    }
+
     pub fn applied(&self) -> u64 {
         self.apply_state.get_applied_index()
+    }
+
+    pub fn singleton(&self) -> bool {
+        let members = self.replica_state.get_region().get_peers();
+        members.len() == 1 && members[0].get_id() == self.id
     }
 
     pub fn append(
