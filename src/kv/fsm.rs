@@ -1,7 +1,7 @@
 use super::storage::{self, address_key, valid_data_key};
 use super::{Command, InvokeContext, Msg, RaftClient, Res, RockStorage};
 use crate::{r, Config, Result};
-use crossbeam::channel::{self, Receiver, RecvTimeoutError, Sender};
+use crossbeam::channel::{self, Receiver, RecvTimeoutError, Sender, TrySendError};
 use futures::channel::mpsc;
 use futures_timer::Delay;
 use raft::eraftpb::{Entry, Message};
@@ -29,6 +29,18 @@ struct ReadRequest {
     start: Instant,
 }
 
+#[derive(Default)]
+struct Notifiers {
+    proposal_queue: VecDeque<Proposal>,
+    // ReadIndex don't have order, and can easily lose, use `HashMap`
+    // for simplicity.
+    read_states: HashMap<u64, ReadRequest>,
+    read_queue: BTreeMap<u64, Vec<mpsc::Sender<Res>>>,
+    wait_elected: Vec<mpsc::Sender<Res>>,
+    wait_leader: Vec<mpsc::Sender<Res>>,
+    wait_commit: Vec<mpsc::Sender<Res>>,
+}
+
 pub struct Fsm {
     node: RawNode<RockStorage>,
     receiver: Receiver<Msg>,
@@ -45,12 +57,7 @@ pub struct Fsm {
     last_ready_number: u64,
     last_sync_time: Instant,
     raft_client: RaftClient,
-    proposal_queue: VecDeque<Proposal>,
-    // ReadIndex don't have order, and can easily lose, use `HashMap`
-    // for simplicity.
-    read_states: HashMap<u64, ReadRequest>,
-    read_queue: BTreeMap<u64, Vec<mpsc::Sender<Res>>>,
-    role_observer: Vec<mpsc::Sender<Res>>,
+    notifiers: Notifiers,
 }
 
 impl Fsm {
@@ -111,10 +118,7 @@ impl Fsm {
             persisted_messages: Vec::with_capacity(4096),
             last_ready_number: 0,
             last_sync_time: Instant::now(),
-            proposal_queue: VecDeque::with_capacity(4096),
-            read_states: HashMap::with_capacity(4097),
-            read_queue: BTreeMap::new(),
-            role_observer: vec![],
+            notifiers: Notifiers::default(),
         };
         fsm.on_start();
         Ok(fsm)
@@ -158,65 +162,111 @@ impl Fsm {
             Delay::new(Duration::from_millis(200)).await;
             // TODO: use unbounded channel instead.
             sender.try_send(Msg::Tick).unwrap_or_else(|e| {
-                panic!("failed to send tick: {:?}", e);
+                if let TrySendError::Full(_) = e {
+                    panic!("failed to send tick: {:?}", e);
+                }
             })
         });
     }
 
     fn get_notifier(&mut self, index: u64, term: u64) -> Option<mpsc::Sender<Res>> {
         loop {
-            let front = match self.proposal_queue.front() {
+            let front = match self.notifiers.proposal_queue.front() {
                 Some(p) => p,
                 None => return None,
             };
             if front.term < term {
-                self.proposal_queue.pop_front();
+                self.notifiers.proposal_queue.pop_front();
                 continue;
             } else if front.term > term || front.index > index {
                 return None;
             }
             assert_eq!(front.index, index, "{}", term);
-            return self.proposal_queue.pop_front().map(|p| p.notifier);
+            return self
+                .notifiers
+                .proposal_queue
+                .pop_front()
+                .map(|p| p.notifier);
         }
     }
 
     fn process(&mut self, start: Instant, msg: Msg) {
         match msg {
-            Msg::Command { cmd, notifier } => {
-                let (context, data) = cmd.into_proposal();
-                match self.node.propose(context, data) {
-                    Ok(()) => {
-                        self.has_ready = true;
-                        if let Some(notifier) = notifier {
-                            self.proposal_queue.push_back(Proposal {
-                                term: self.node.raft.term,
-                                index: self.node.raft.raft_log.last_index(),
-                                notifier,
-                            })
-                        }
+            Msg::Command {
+                cmd,
+                term,
+                notifier,
+            } => {
+                if term.map_or(false, |t| t != self.node.raft.term) {
+                    if let Some(mut notifier) = notifier {
+                        let msg = format!(
+                            "term not match {} != {}",
+                            term.unwrap(),
+                            self.node.raft.term
+                        );
+                        let _ = notifier.try_send(Res::Fail(msg));
                     }
-                    Err(e) => {
-                        let err_msg = format!("failed to make proposal: {}", e);
-                        info!(self.logger, "{}", err_msg);
-                        if let Some(mut notifier) = notifier {
-                            let _ = notifier.try_send(Res::Fail(err_msg));
-                        }
+                    return;
+                }
+                if self.node.raft.leader_id != self.id() {
+                    if let Some(mut notifier) = notifier {
+                        let msg = format!("leader is {}", self.node.raft.leader_id);
+                        let _ = notifier.try_send(Res::Fail(msg));
+                    }
+                    return;
+                }
+                let (context, data) = cmd.into_proposal();
+                let last_last_index = self.node.raft.raft_log.last_index();
+                let e = self.node.propose(context, data).err();
+                let last_index = self.node.raft.raft_log.last_index();
+                if last_last_index < last_index {
+                    self.has_ready = true;
+                    if let Some(notifier) = notifier {
+                        self.notifiers.proposal_queue.push_back(Proposal {
+                            term: self.node.raft.term,
+                            index: last_index,
+                            notifier,
+                        })
+                    }
+                } else {
+                    let err_msg = format!("failed to make proposal: {:?}", e);
+                    info!(self.logger, "{}", err_msg);
+                    if let Some(mut notifier) = notifier {
+                        let _ = notifier.try_send(Res::Fail(err_msg));
                     }
                 }
             }
-            Msg::Snapshot(notifier) => {
+            Msg::Snapshot { term, mut notifier } => {
                 // This is not technically safe, should use uuid.
+                let my_term = self.node.raft.term;
+                if term.map_or(false, |t| t != my_term) {
+                    let msg = format!("term not match {} != {}", term.unwrap(), my_term);
+                    let _ = notifier.try_send(Res::Fail(msg));
+                    return;
+                }
                 let state: u64 = rand::random();
                 self.node.read_index(state.to_ne_bytes().to_vec());
-                self.read_states
+                self.notifiers
+                    .read_states
                     .insert(state, ReadRequest { notifier, start });
             }
-            Msg::WaitTillLeader(mut notifier) => {
+            Msg::WaitTillElected {
+                leader,
+                commit_to_current_term,
+                mut notifier,
+            } => {
                 let leader_id = self.node.raft.leader_id;
-                if leader_id != 0 {
-                    let _ = notifier.try_send(Res::Leader(leader_id));
+                if leader_id != 0 && (!leader || leader_id == self.id()) {
+                    let _ = notifier.try_send(Res::RoleInfo {
+                        term: self.node.raft.term,
+                        leader: leader_id,
+                    });
+                } else if commit_to_current_term {
+                    self.notifiers.wait_commit.push(notifier);
+                } else if leader {
+                    self.notifiers.wait_leader.push(notifier);
                 } else {
-                    self.role_observer.push(notifier);
+                    self.notifiers.wait_elected.push(notifier);
                 }
             }
             Msg::RaftMessage(msg) => {
@@ -270,7 +320,6 @@ impl Fsm {
 
     fn send_messages(&mut self, msgs: Vec<Message>) {
         for msg in msgs {
-            info!(self.logger, "sending {:?}", msg);
             self.raft_client.send(msg);
         }
     }
@@ -278,13 +327,14 @@ impl Fsm {
     fn process_read(&mut self, read_states: Vec<ReadState>) {
         for read in read_states {
             let id = u64::from_ne_bytes(read.request_ctx.try_into().unwrap());
-            if let Some(mut req) = self.read_states.remove(&id) {
+            if let Some(mut req) = self.notifiers.read_states.remove(&id) {
                 if read.index <= self.node.store().applied() {
                     let _ = req
                         .notifier
                         .try_send(Res::Snapshot(self.node.store().rock_snapshot()));
                 }
-                self.read_queue
+                self.notifiers
+                    .read_queue
                     .entry(read.index)
                     .or_default()
                     .push(req.notifier);
@@ -293,7 +343,7 @@ impl Fsm {
     }
 
     fn clean_stale_read_req(&mut self, start: Instant) {
-        self.read_states.retain(|_, v| {
+        self.notifiers.read_states.retain(|_, v| {
             if start
                 .checked_duration_since(v.start)
                 .map_or(false, |d| d > Duration::from_secs(10))
@@ -307,9 +357,35 @@ impl Fsm {
     }
 
     fn notify_role_changed(&mut self) {
-        if self.node.raft.leader_id != INVALID_ID && !self.role_observer.is_empty() {
-            for mut ob in self.role_observer.drain(..) {
-                let _ = ob.try_send(Res::Leader(self.node.raft.leader_id));
+        let leader_id = self.node.raft.leader_id;
+        let term = self.node.raft.term;
+        if leader_id != INVALID_ID {
+            if !self.notifiers.wait_elected.is_empty() {
+                for mut ob in self.notifiers.wait_elected.drain(..) {
+                    let _ = ob.try_send(Res::RoleInfo {
+                        leader: leader_id,
+                        term,
+                    });
+                }
+            }
+            if leader_id == self.id() {
+                if !self.notifiers.wait_leader.is_empty() {
+                    for mut ob in self.notifiers.wait_leader.drain(..) {
+                        let _ = ob.try_send(Res::RoleInfo {
+                            leader: leader_id,
+                            term,
+                        });
+                    }
+                }
+                if !self.notifiers.wait_commit.is_empty() && self.node.raft.commit_to_current_term()
+                {
+                    for mut ob in self.notifiers.wait_commit.drain(..) {
+                        let _ = ob.try_send(Res::RoleInfo {
+                            leader: leader_id,
+                            term,
+                        });
+                    }
+                }
             }
         }
     }

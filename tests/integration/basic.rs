@@ -2,18 +2,10 @@ use crate::cluster::Cluster;
 use futures::channel::mpsc;
 use futures::StreamExt;
 use mini_pd::*;
-use sloggers::terminal::{Destination, TerminalLoggerBuilder};
-use sloggers::types::Severity;
-use sloggers::Build;
 
 #[futures_test::test]
 async fn test_single_node() {
-    let mut builder = TerminalLoggerBuilder::new();
-    builder.level(Severity::Debug);
-    builder.destination(Destination::Stderr);
-    let logger = builder.build().unwrap();
-
-    let mut cluster = Cluster::new(1, 1, logger);
+    let mut cluster = Cluster::new(1, 1);
     cluster.start();
 
     let sender = cluster.server(1).sender();
@@ -26,7 +18,7 @@ async fn test_single_node() {
     let res = rx.next().await;
     assert!(matches!(res, Some(Res::Success)), "{:?}", res);
 
-    sender.send(Msg::Snapshot(tx.clone())).unwrap();
+    sender.send(Msg::snapshot(tx.clone())).unwrap();
     let snap = rx.next().await;
     match snap {
         Some(Res::Snapshot(s)) => {
@@ -39,20 +31,21 @@ async fn test_single_node() {
 
 #[futures_test::test]
 async fn test_multi_node() {
-    let mut builder = TerminalLoggerBuilder::new();
-    builder.level(Severity::Debug);
-    builder.destination(Destination::Stderr);
-    let logger = builder.build().unwrap();
-
-    let mut cluster = Cluster::new(5, 3, logger);
+    let mut cluster = Cluster::new(5, 3);
     cluster.start();
 
     let mut sender = cluster.server(1).sender();
     let (tx, mut rx) = mpsc::channel(10);
 
-    sender.send(Msg::WaitTillLeader(tx.clone())).unwrap();
+    sender
+        .send(Msg::WaitTillElected {
+            leader: false,
+            commit_to_current_term: false,
+            notifier: tx.clone(),
+        })
+        .unwrap();
     let leader = match rx.next().await {
-        Some(Res::Leader(id)) => id,
+        Some(Res::RoleInfo { leader, .. }) => leader,
         res => panic!("failed to wait for election finish: {:?}", res),
     };
 
@@ -68,7 +61,7 @@ async fn test_multi_node() {
 
     for id in 1..=3 {
         let sender = cluster.server(id).sender();
-        sender.send(Msg::Snapshot(tx.clone())).unwrap();
+        sender.send(Msg::snapshot(tx.clone())).unwrap();
         let snap = rx.next().await.unwrap();
         match snap {
             Res::Snapshot(s) => {

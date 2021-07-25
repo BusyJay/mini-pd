@@ -1,9 +1,10 @@
-use super::service::RaftService;
+use super::service::{PdService, RaftService};
 use crate::kv::{AddressMap, Fsm, Msg, RaftClient};
+use crate::tso::TsoAllocator;
 use crate::{Config, Error, Result};
 use crossbeam::channel::Sender;
 use grpcio::{EnvBuilder, Environment};
-use kvproto::minipdpb;
+use kvproto::{minipdpb, pdpb};
 use slog::Logger;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -100,11 +101,22 @@ impl Server {
 
     fn start_grpc_server(&mut self) -> Result<()> {
         let handle = self.handle.as_ref().unwrap();
-        let service = RaftService::new(handle.id, handle.sender.clone(), self.logger.clone());
-        let service = minipdpb::create_mini_pd_raft(service);
+        let raft_service = RaftService::new(handle.id, handle.sender.clone(), self.logger.clone());
+        let raft_service = minipdpb::create_mini_pd_raft(raft_service);
+
+        let tso = TsoAllocator::new(
+            handle.sender.clone(),
+            self.pool.remote(),
+            self.logger.clone(),
+        );
+        let pd_service = PdService::new(tso, self.pool.remote().clone(), self.logger.clone());
+        let pd_service = pdpb::create_pd(pd_service);
+
         let (host, port) = self.get_bind_pair()?;
         let mut server = grpcio::ServerBuilder::new(handle.env.clone())
-            .register_service(service)
+            // Maybe it's a better idea to use different thread for raft and pd.
+            .register_service(raft_service)
+            .register_service(pd_service)
             .bind(host, port)
             .build()?;
         server.start();
@@ -114,6 +126,10 @@ impl Server {
 
     pub fn sender(&self) -> &Sender<Msg> {
         self.handle.as_ref().unwrap().sender()
+    }
+
+    pub fn advertise_address(&self) -> &str {
+        &self.config.advertise_address
     }
 
     pub fn shutdown(&mut self) {

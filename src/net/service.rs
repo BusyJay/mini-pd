@@ -1,12 +1,35 @@
+use std::cmp;
+
 use crate::kv::Msg;
-use futures::prelude::*;
+use crate::tso::TsoAllocator;
+use crate::Error;
+use futures::channel::mpsc;
+use futures::{join, prelude::*};
 use grpcio::{ClientStreamingSink, RequestStream, RpcContext, RpcStatus, RpcStatusCode};
+use grpcio::{DuplexSink, WriteFlags};
 use kvproto::minipdpb::*;
 use kvproto::pdpb::*;
 use raft::eraftpb::Message;
 use slog::{error, Logger};
+use yatp::task::future::TaskCell;
+use yatp::Remote;
 
-pub struct PdService;
+#[derive(Clone)]
+pub struct PdService {
+    tso: TsoAllocator,
+    remote: Remote<TaskCell>,
+    logger: Logger,
+}
+
+impl PdService {
+    pub fn new(tso: TsoAllocator, remote: Remote<TaskCell>, logger: Logger) -> PdService {
+        PdService {
+            tso,
+            remote,
+            logger,
+        }
+    }
+}
 
 impl Pd for PdService {
     fn get_members(
@@ -17,14 +40,83 @@ impl Pd for PdService {
     ) {
         grpcio::unimplemented_call!(ctx, sink)
     }
+
     fn tso(
         &mut self,
-        ctx: ::grpcio::RpcContext,
-        _stream: ::grpcio::RequestStream<TsoRequest>,
-        sink: ::grpcio::DuplexSink<TsoResponse>,
+        ctx: RpcContext,
+        stream: RequestStream<TsoRequest>,
+        mut sink: DuplexSink<TsoResponse>,
     ) {
-        grpcio::unimplemented_call!(ctx, sink)
+        let allocator = self.tso.clone();
+        let logger = self.logger.clone();
+        let f = async move {
+            let (batch_tx, mut batch_rx) = mpsc::channel(100);
+            let collect = async move {
+                let mut wrap_stream = stream.map_err(Error::Rpc);
+                let mut wrap_tx =
+                    batch_tx.sink_map_err(|e| Error::Other(format!("failed to forward: {}", e)));
+                wrap_tx.send_all(&mut wrap_stream).await
+            };
+            let mut buf = Vec::with_capacity(100);
+            let batch_process = async {
+                loop {
+                    let req = match batch_rx.next().await {
+                        Some(r) => r,
+                        None => {
+                            sink.close().await?;
+                            return Ok::<_, Error>(());
+                        }
+                    };
+                    let mut sum = cmp::max(req.get_count() as u64, 1);
+                    while let Ok(Some(r)) = batch_rx.try_next() {
+                        sum += cmp::max(r.get_count() as u64, 1);
+                        buf.push(r);
+                    }
+                    let ts = match allocator.alloc(sum).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            for i in 0..buf.len() + 1 {
+                                let mut resp = TsoResponse::default();
+                                resp.mut_header()
+                                    .mut_error()
+                                    .set_field_type(ErrorType::UNKNOWN);
+                                resp.mut_header().mut_error().set_message(format!("{}", e));
+                                sink.send((
+                                    resp,
+                                    WriteFlags::default().buffer_hint(i != buf.len()),
+                                ))
+                                .await?;
+                            }
+                            continue;
+                        }
+                    };
+                    let mut start = ts - sum + 1;
+                    let mut resp = TsoResponse::default();
+                    resp.set_count(req.get_count());
+                    resp.mut_timestamp().set_logical(start as i64);
+                    resp.mut_timestamp().set_physical(start as i64);
+                    sink.send((resp, WriteFlags::default().buffer_hint(!buf.is_empty())))
+                        .await?;
+                    start += cmp::max(req.get_count() as u64, 1);
+                    for (i, req) in buf.iter().enumerate() {
+                        let mut resp = TsoResponse::default();
+                        resp.set_count(req.get_count());
+                        resp.mut_timestamp().set_logical(start as i64);
+                        resp.mut_timestamp().set_physical(start as i64);
+                        sink.send((resp, WriteFlags::default().buffer_hint(i + 1 != buf.len())))
+                            .await?;
+                        start += cmp::max(req.get_count() as u64, 1);
+                    }
+                }
+            };
+            let res = join!(collect, batch_process);
+            if res.0.is_err() || res.1.is_err() {
+                error!(logger, "failed to handle tso: {:?}", res);
+            }
+        };
+        ctx.spawn(f);
     }
+
     fn bootstrap(
         &mut self,
         ctx: ::grpcio::RpcContext,

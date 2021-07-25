@@ -13,6 +13,10 @@ impl Command {
     const PUT_SHORT_KEY: u8 = 0x01;
     const UPDATE_ADDRESS: u8 = 0x02;
 
+    pub fn put(key: Bytes, value: Bytes) -> Command {
+        Command::Put { key, value }
+    }
+
     pub fn into_proposal(self) -> (Vec<u8>, Vec<u8>) {
         match self {
             Command::Put { key, value } => {
@@ -59,7 +63,7 @@ impl Command {
 pub enum Res {
     Success,
     Snapshot(RockSnapshot),
-    Leader(u64),
+    RoleInfo { term: u64, leader: u64 },
     Fail(String),
 }
 
@@ -68,7 +72,13 @@ impl Debug for Res {
         match self {
             Res::Success => write!(formatter, "Res::Success"),
             Res::Snapshot(_) => write!(formatter, "Res::Snapshot"),
-            Res::Leader(id) => write!(formatter, "Res::Leader({})", id),
+            Res::RoleInfo { term, leader } => {
+                write!(
+                    formatter,
+                    "Res::RoleInfo {{ term: {}, leader: {} }}",
+                    term, leader
+                )
+            }
             Res::Fail(s) => write!(formatter, "Res::Fail({:?})", s),
         }
     }
@@ -77,10 +87,18 @@ impl Debug for Res {
 pub enum Msg {
     Command {
         cmd: Command,
+        term: Option<u64>,
         notifier: Option<Sender<Res>>,
     },
-    Snapshot(Sender<Res>),
-    WaitTillLeader(Sender<Res>),
+    Snapshot {
+        term: Option<u64>,
+        notifier: Sender<Res>,
+    },
+    WaitTillElected {
+        leader: bool,
+        commit_to_current_term: bool,
+        notifier: Sender<Res>,
+    },
     RaftMessage(Message),
     Tick,
     Stop,
@@ -88,7 +106,33 @@ pub enum Msg {
 
 impl Msg {
     pub fn command(cmd: Command, notifier: Option<Sender<Res>>) -> Msg {
-        Msg::Command { cmd, notifier }
+        Msg::Command {
+            cmd,
+            term: None,
+            notifier,
+        }
+    }
+
+    pub fn check_term_command(cmd: Command, term: u64, notifier: Option<Sender<Res>>) -> Msg {
+        Msg::Command {
+            cmd,
+            term: Some(term),
+            notifier,
+        }
+    }
+
+    pub fn snapshot(notifier: Sender<Res>) -> Msg {
+        Msg::Snapshot {
+            term: None,
+            notifier,
+        }
+    }
+
+    pub fn check_snapshot(term: u64, notifier: Sender<Res>) -> Msg {
+        Msg::Snapshot {
+            term: Some(term),
+            notifier,
+        }
     }
 }
 
