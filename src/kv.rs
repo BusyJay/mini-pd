@@ -7,5 +7,6 @@ pub use fsm::Fsm;
 pub use msg::{Command, Event, Msg, Res};
 pub use raft_client::{AddressMap, RaftClient};
 pub use storage::{
-    bootstrap, combine_key, get_msg, load_address, load_replica_ids, InvokeContext, RockStorage,
+    bootstrap, combine_key, get_msg, load_address, load_replica_ids, InvokeContext, RockSnapshot,
+    RockSnapshotFactory, RockStorage,
 };

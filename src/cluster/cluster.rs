@@ -1,5 +1,17 @@
+use bytes::{BufMut, Bytes, BytesMut};
+use crossbeam::channel::Sender;
+use futures::{channel::mpsc, StreamExt};
+use futures_timer::Delay;
+use kvproto::{
+    metapb::{self, StoreState},
+    pdpb::{self, Member, StoreStats},
+};
+use parking_lot::Mutex;
+use protobuf::Message;
+use rocksdb::{DBIterator, ReadOptions, SeekKey, DB};
+use slog::{error, info, Logger};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     convert::TryInto,
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
@@ -7,24 +19,12 @@ use std::{
     },
     time::Duration,
 };
-
-use bytes::{BufMut, Bytes, BytesMut};
-use crossbeam::channel::Sender;
-use futures::{channel::mpsc, StreamExt};
-use futures_timer::Delay;
-use kvproto::{
-    metapb,
-    pdpb::{self, Member},
-};
-use parking_lot::Mutex;
-use protobuf::Message;
-use rocksdb::{ReadOptions, SeekKey, DB};
-use slog::{error, info, Logger};
 use yatp::{task::future::TaskCell, Remote};
 
+use crate::kv::RockSnapshot;
 use crate::{kv, Command, Error, Event, Msg, Res, Result};
 
-use super::stats::{Region, Store};
+use super::stats::RegionStats;
 
 const CLUSTER_ID_KEY: Bytes = Bytes::from_static(b"dcluster");
 const CLUSTER_BOOTSTRAP_KEY: Bytes = Bytes::from_static(b"dcluster_bootstrap");
@@ -63,13 +63,17 @@ pub fn load_store(db: &DB, id: u64, store: &mut metapb::Store) -> Result<()> {
     }
 }
 
-pub fn load_all_stores(db: &DB) -> Result<Vec<metapb::Store>> {
-    let start_key = store_key(0);
+fn iter_all_store(snap: &RockSnapshot) -> DBIterator<&DB> {
     let end_key = store_key(u64::MAX);
     let mut opt = ReadOptions::default();
     opt.set_iterate_upper_bound(end_key.to_vec());
-    let mut iter = db.iter_opt(opt);
+    snap.iter_opt(opt)
+}
+
+pub fn load_all_stores(snap: &RockSnapshot) -> Result<Vec<metapb::Store>> {
+    let mut iter = iter_all_store(snap);
     let mut stores = Vec::with_capacity(3);
+    let start_key = store_key(0);
     if iter.seek(SeekKey::Key(&start_key)).unwrap() {
         loop {
             let mut store = metapb::Store::default();
@@ -83,7 +87,57 @@ pub fn load_all_stores(db: &DB) -> Result<Vec<metapb::Store>> {
     Ok(stores)
 }
 
-async fn bootstrap(cluster: &Cluster) {
+pub fn load_all_regions(snap: &RockSnapshot) -> Result<Vec<metapb::Region>> {
+    let start_key = region_key(0);
+    let end_key = region_key(u64::MAX);
+    let mut opt = ReadOptions::default();
+    opt.set_iterate_upper_bound(end_key.to_vec());
+    let mut iter = snap.iter_opt(opt);
+    let mut regions = Vec::with_capacity(4096);
+    if iter.seek(SeekKey::Key(&start_key)).unwrap() {
+        loop {
+            let mut region = metapb::Region::default();
+            region.merge_from_bytes(iter.value())?;
+            regions.push(region);
+            if !iter.next().unwrap() {
+                break;
+            }
+        }
+    }
+    Ok(regions)
+}
+
+pub fn get_cluster_version(snap: &RockSnapshot) -> Result<String> {
+    let mut iter = iter_all_store(snap);
+    let start_key = store_key(0);
+    if iter.seek(SeekKey::Key(&start_key)).unwrap() {
+        loop {
+            let mut store = metapb::Store::default();
+            store.merge_from_bytes(iter.value())?;
+            if store.get_state() != StoreState::Tombstone {
+                // TODO: correct way should use lease version.
+                return Ok(store.take_version());
+            }
+            if !iter.next().unwrap() {
+                break;
+            }
+        }
+    }
+    Err(Error::Other("version not found".to_string()))
+}
+
+pub fn load_region(db: &DB, id: u64, region: &mut metapb::Region) -> Result<()> {
+    let key = region_key(id);
+    match kv::get_msg(db, &key)? {
+        Some(s) => {
+            *region = s;
+            Ok(())
+        }
+        None => Err(Error::Other("region not found".to_string())),
+    }
+}
+
+async fn bootstrap(cluster: Cluster) {
     let (tx, mut rx) = mpsc::channel(1);
     loop {
         let msg = Msg::WaitEvent {
@@ -163,11 +217,39 @@ async fn bootstrap(cluster: &Cluster) {
     }
 }
 
+async fn reload_cluser_meta(cluster: Cluster) {
+    let (tx, mut rx) = mpsc::channel(1);
+    let mut last_term = 0;
+    loop {
+        let msg = Msg::WaitEvent {
+            event: Event::CommittedToCurrentTermAsLeader,
+            notifier: tx.clone(),
+        };
+        cluster.sender.send(msg).unwrap();
+        let term = match rx.next().await {
+            Some(Res::RoleInfo { term, .. }) => term,
+            _ => return,
+        };
+        if term == last_term {
+            Delay::new(Duration::from_secs(10)).await;
+            continue;
+        }
+        cluster.meta.stores.lock().clear();
+        cluster.meta.regions.lock().clear();
+        last_term = term;
+    }
+}
+
+// id, version
+type RegionRef = (u64, u64);
+
 pub struct ClusterMeta {
     id: AtomicU64,
     bootstrap: AtomicU8,
-    regions: Arc<Mutex<HashMap<u64, Region>>>,
-    stores: Arc<Mutex<HashMap<u64, Store>>>,
+    regions: Mutex<HashMap<u64, RegionStats>>,
+    stores: Mutex<HashMap<u64, StoreStats>>,
+    // Double Arc to allow cheap copy and short lock.
+    range_caches: Mutex<Arc<BTreeMap<Vec<u8>, (u64, u64)>>>,
 }
 
 impl ClusterMeta {
@@ -180,12 +262,12 @@ impl ClusterMeta {
         self.bootstrap.load(Ordering::Relaxed) == BOOTSTRAPPED
     }
 
-    pub fn stores(&self) -> Arc<Mutex<HashMap<u64, Store>>> {
-        self.stores.clone()
+    pub fn stores(&self) -> &Mutex<HashMap<u64, StoreStats>> {
+        &self.stores
     }
 
-    pub fn regions(&self) -> Arc<Mutex<HashMap<u64, Region>>> {
-        self.regions.clone()
+    pub fn regions(&self) -> &Mutex<HashMap<u64, RegionStats>> {
+        &self.regions
     }
 }
 
@@ -207,12 +289,13 @@ impl BootstrapGuard {
         let (tx, mut rx) = mpsc::channel(1);
         let mut buffer = store.write_length_delimited_to_bytes()?;
         region.write_length_delimited_to_vec(&mut buffer)?;
-        let mut kvs = Vec::with_capacity(2);
-        kvs.push((CLUSTER_BOOTSTRAP_KEY, buffer.into()));
-        kvs.push((
-            region_key(region.get_id()),
-            region.write_length_delimited_to_bytes().unwrap().into(),
-        ));
+        let kvs = vec![
+            (CLUSTER_BOOTSTRAP_KEY, buffer.into()),
+            (
+                region_key(region.get_id()),
+                region.write_length_delimited_to_bytes().unwrap().into(),
+            ),
+        ];
         let command = Command::batch_put(kvs);
         let msg = Msg::command(command, Some(tx));
         self.cluster.sender.send(msg).unwrap();
@@ -252,14 +335,17 @@ impl Cluster {
             meta: Arc::new(ClusterMeta {
                 id: AtomicU64::new(0),
                 bootstrap: AtomicU8::new(NOT_BOOTSTRAP),
-                regions: Arc::default(),
-                stores: Arc::default(),
+                regions: Default::default(),
+                stores: Default::default(),
+                range_caches: Default::default(),
             }),
             sender,
             logger,
         };
         let c = cluster.clone();
-        remote.spawn(async move { bootstrap(&c).await });
+        remote.spawn(async move { bootstrap(c).await });
+        let c = cluster.clone();
+        remote.spawn(async move { reload_cluser_meta(c).await });
         cluster
     }
 
@@ -348,33 +434,22 @@ impl Cluster {
         if !matches!(res, Some(Res::Success)) {
             return Err(Error::Other(format!("failed to put store: {:?}", res)));
         }
-        let mut guard = self.meta.stores.lock();
-        let s = guard.entry(store.id).or_default();
-        s.store = store;
         Ok(())
     }
 
     pub fn update_store_stats(&self, stats: pdpb::StoreStats) {
-        let mut guard = self.meta.stores.lock();
-        if let Some(s) = guard.get_mut(&stats.get_store_id()) {
-            s.stats = stats;
-        }
+        self.meta.stores.lock().insert(stats.get_store_id(), stats);
     }
 
-    pub fn get_cluster_version(&self) -> Option<String> {
-        let guard = self.meta.stores.lock();
-        if guard.is_empty() {
-            return None;
-        }
-        let store = guard.iter().next().unwrap().1;
-        Some(store.store.get_version().to_string())
-    }
-
-    pub fn stores(&self) -> Arc<Mutex<HashMap<u64, Store>>> {
+    pub fn stores(&self) -> &Mutex<HashMap<u64, StoreStats>> {
         self.meta.stores()
     }
 
-    pub fn regions(&self) -> Arc<Mutex<HashMap<u64, Region>>> {
+    pub fn regions(&self) -> &Mutex<HashMap<u64, RegionStats>> {
         self.meta.regions()
+    }
+
+    pub fn range_caches(&self) -> &Mutex<Arc<BTreeMap<Vec<u8>, RegionRef>>> {
+        &self.meta.range_caches
     }
 }

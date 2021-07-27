@@ -16,7 +16,7 @@ pub struct Allocator {
 impl Allocator {
     pub fn new(sender: Sender<Msg>, remote: &Remote<TaskCell>, logger: Logger) -> Allocator {
         let tso = tso::TsoAllocator::new(sender.clone(), remote, logger.clone());
-        let id = id::IdAllocator::new(sender.clone(), remote, logger);
+        let id = id::IdAllocator::new(sender, remote, logger);
 
         Allocator { id, tso }
     }

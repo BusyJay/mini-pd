@@ -23,6 +23,17 @@ pub static DATA_PREFIX_KEY: u8 = b'd';
 const INIT_TERM: u64 = 3;
 const INIT_INDEX: u64 = 3;
 
+pub trait RockSnapshotFactory {
+    fn build(&self) -> RockSnapshot;
+}
+
+impl RockSnapshotFactory for Arc<DB> {
+    #[inline]
+    fn build(&self) -> RockSnapshot {
+        RockSnapshot::new(self.clone())
+    }
+}
+
 pub fn combine_key(prefix: &[u8], id: u64) -> Bytes {
     let mut buf = BytesMut::with_capacity(prefix.len() + 8);
     buf.put_slice(prefix);

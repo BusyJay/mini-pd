@@ -1,14 +1,17 @@
 use crate::allocator::{self, Allocator};
 use crate::cluster::{self, Cluster, ClusterMeta, BOOTSTRAPPING};
+use crate::kv::{RockSnapshot, RockSnapshotFactory};
 use crate::Error;
 use futures::channel::mpsc;
 use futures::{join, prelude::*};
 use grpcio::{DuplexSink, WriteFlags};
 use grpcio::{RequestStream, RpcContext, UnarySink};
-use kvproto::pdpb::*;
+use kvproto::metapb;
+use kvproto::pdpb::{self, *};
 use rocksdb::DB;
 use slog::{error, Logger};
 use std::cmp;
+use std::ops::Bound::*;
 use std::sync::Arc;
 use yatp::task::future::TaskCell;
 use yatp::Remote;
@@ -118,6 +121,57 @@ impl PdService {
             logger,
         }
     }
+
+    fn get_region_by_id_impl(
+        &self,
+        ctx: RpcContext,
+        id: Option<u64>,
+        mut resp: GetRegionResponse,
+        sink: UnarySink<GetRegionResponse>,
+    ) {
+        if let Some(id) = id {
+            if cluster::load_region(&self.db, id, resp.mut_region()).is_ok() {
+                if let Some(stats) = self.cluster.regions().lock().get(&id).cloned() {
+                    if let Some(leader) = stats.leader {
+                        resp.set_leader(leader);
+                    }
+                    resp.set_down_peers(stats.down_peer.into());
+                    resp.set_pending_peers(stats.pending_peer.into());
+                }
+            }
+        }
+        if !resp.get_region().has_region_epoch() {
+            fill_error(
+                resp.mut_header(),
+                ErrorType::REGION_NOT_FOUND,
+                String::new(),
+            );
+        }
+        ctx.spawn(async move {
+            let _ = sink.success(resp);
+        });
+    }
+
+    fn get_region_impl(
+        &mut self,
+        ctx: RpcContext,
+        mut req: GetRegionRequest,
+        sink: UnarySink<GetRegionResponse>,
+        reverse: bool,
+    ) {
+        let resp = check_bootstrap!(ctx, self.cluster, sink, req, GetRegionResponse::default());
+        let range_caches = self.cluster.range_caches().lock().clone();
+        let res = if !reverse {
+            range_caches
+                .range((Excluded(req.take_region_key()), Unbounded))
+                .next()
+        } else {
+            range_caches
+                .range((Unbounded, Included(req.take_region_key())))
+                .next_back()
+        };
+        self.get_region_by_id_impl(ctx, res.map(|r| r.1 .0), resp, sink);
+    }
 }
 
 impl Pd for PdService {
@@ -133,7 +187,7 @@ impl Pd for PdService {
             match cluster.get_members().await {
                 Ok((leader, peers)) => {
                     resp.set_leader(leader.clone());
-                    resp.set_etcd_leader(leader.clone());
+                    resp.set_etcd_leader(leader);
                     resp.set_members(peers.into());
                 }
                 Err(e) => {
@@ -331,6 +385,7 @@ impl Pd for PdService {
         };
         ctx.spawn(f);
     }
+
     fn get_all_stores(
         &mut self,
         ctx: ::grpcio::RpcContext,
@@ -344,7 +399,7 @@ impl Pd for PdService {
             req,
             GetAllStoresResponse::default()
         );
-        match cluster::load_all_stores(&self.db) {
+        match cluster::load_all_stores(&RockSnapshot::new(self.db.clone())) {
             Ok(stores) => resp.set_stores(stores.into()),
             Err(e) => fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e)),
         }
@@ -368,7 +423,7 @@ impl Pd for PdService {
         );
         self.cluster.update_store_stats(req.take_stats());
         // TODO: support cluster version.
-        if let Some(version) = self.cluster.get_cluster_version() {
+        if let Ok(version) = cluster::get_cluster_version(&self.db.build()) {
             resp.set_cluster_version(version);
         }
         ctx.spawn(async move {
@@ -388,35 +443,79 @@ impl Pd for PdService {
     fn get_region(
         &mut self,
         ctx: ::grpcio::RpcContext,
-        _req: GetRegionRequest,
+        req: GetRegionRequest,
         sink: ::grpcio::UnarySink<GetRegionResponse>,
     ) {
-        grpcio::unimplemented_call!(ctx, sink)
+        self.get_region_impl(ctx, req, sink, false)
     }
+
     fn get_prev_region(
         &mut self,
         ctx: ::grpcio::RpcContext,
-        _req: GetRegionRequest,
+        req: GetRegionRequest,
         sink: ::grpcio::UnarySink<GetRegionResponse>,
     ) {
-        grpcio::unimplemented_call!(ctx, sink)
+        self.get_region_impl(ctx, req, sink, true)
     }
+
     fn get_region_by_id(
         &mut self,
         ctx: ::grpcio::RpcContext,
-        _req: GetRegionByIDRequest,
+        req: GetRegionByIDRequest,
         sink: ::grpcio::UnarySink<GetRegionResponse>,
     ) {
-        grpcio::unimplemented_call!(ctx, sink)
+        let resp = check_bootstrap!(ctx, self.cluster, sink, req, GetRegionResponse::default());
+        self.get_region_by_id_impl(ctx, Some(req.get_region_id()), resp, sink)
     }
+
     fn scan_regions(
         &mut self,
         ctx: ::grpcio::RpcContext,
-        _req: ScanRegionsRequest,
+        mut req: ScanRegionsRequest,
         sink: ::grpcio::UnarySink<ScanRegionsResponse>,
     ) {
-        grpcio::unimplemented_call!(ctx, sink)
+        let mut resp =
+            check_bootstrap!(ctx, self.cluster, sink, req, ScanRegionsResponse::default());
+        let range_caches = self.cluster.range_caches().lock().clone();
+        let ranges =
+            range_caches.range((Excluded(req.take_start_key()), Included(req.take_end_key())));
+        let mut regions = Vec::with_capacity(64);
+        for (_, (id, _)) in ranges {
+            let mut region = metapb::Region::default();
+            if cluster::load_region(&self.db, *id, &mut region).is_ok() {
+                regions.push(region);
+            } else {
+                break;
+            }
+        }
+        if regions.is_empty() {
+            fill_error(
+                resp.mut_header(),
+                ErrorType::REGION_NOT_FOUND,
+                String::new(),
+            );
+        } else {
+            let stats = self.cluster.regions().lock();
+            for r in regions {
+                let mut s = pdpb::Region::default();
+                s.set_region(r.clone());
+                if let Some(stat) = stats.get(&r.get_id()).cloned() {
+                    if let Some(leader) = stat.leader {
+                        s.set_leader(leader.clone());
+                        resp.mut_leaders().push(leader);
+                    }
+                    s.set_down_peers(stat.down_peer.into());
+                    s.set_pending_peers(stat.pending_peer.into());
+                }
+                resp.mut_regions().push(s);
+                resp.mut_region_metas().push(r);
+            }
+        }
+        ctx.spawn(async move {
+            let _ = sink.success(resp);
+        });
     }
+
     fn ask_split(
         &mut self,
         ctx: ::grpcio::RpcContext,

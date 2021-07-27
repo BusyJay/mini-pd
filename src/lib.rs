@@ -5,7 +5,7 @@ mod error;
 mod kv;
 mod net;
 
-pub use cluster::stats::{PeerState, Region, Store};
+pub use cluster::stats::RegionStats;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use kv::{AddressMap, Command, Event, Msg, Res};
