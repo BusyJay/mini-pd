@@ -1,5 +1,6 @@
 use super::AddressMap;
 use crate::r;
+use bytes::{BufMut, Bytes, BytesMut};
 use kvproto::metapb::{self, Peer, PeerRole};
 use kvproto::raft_serverpb::{RaftApplyState, RaftLocalState, RegionLocalState};
 use protobuf::Message;
@@ -22,6 +23,13 @@ pub static DATA_PREFIX_KEY: u8 = b'd';
 const INIT_TERM: u64 = 3;
 const INIT_INDEX: u64 = 3;
 
+pub fn combine_key(prefix: &[u8], id: u64) -> Bytes {
+    let mut buf = BytesMut::with_capacity(prefix.len() + 8);
+    buf.put_slice(prefix);
+    buf.put_u64(id);
+    buf.freeze()
+}
+
 pub fn log_key(index: u64) -> [u8; 9] {
     let mut buf = [RAFT_LOG_PREFIX_KEY; 9];
     buf[1..].copy_from_slice(&index.to_be_bytes());
@@ -34,11 +42,19 @@ pub fn address_key(id: u64) -> [u8; 9] {
     address
 }
 
+pub fn load_address(snap: &RockSnapshot, id: u64) -> String {
+    let key = address_key(id);
+    match snap.get(&key) {
+        Ok(Some(s)) => String::from_utf8(s.to_vec()).unwrap(),
+        _ => String::new(),
+    }
+}
+
 pub fn valid_data_key(key: &[u8]) -> bool {
     !key.is_empty() && key[0] == DATA_PREFIX_KEY
 }
 
-fn get_msg<T: Message + Default>(db: &DB, key: &[u8]) -> Result<Option<T>> {
+pub fn get_msg<T: Message + Default>(db: &DB, key: &[u8]) -> Result<Option<T>> {
     let val = match db.get(&key) {
         Ok(Some(v)) => v,
         Ok(None) => return Ok(None),
@@ -53,6 +69,22 @@ fn must_get_msg<T: Message + Default>(db: &DB, key: &[u8]) -> Result<T> {
     match get_msg(db, key)? {
         Some(v) => Ok(v),
         None => Err(Error::Store(StorageError::Unavailable)),
+    }
+}
+
+pub fn load_replica_ids(snap: &RockSnapshot) -> Result<Vec<u64>> {
+    let mut state = RegionLocalState::default();
+    match snap.get(&REGION_STATE_KEY) {
+        Ok(Some(v)) => {
+            state.merge_from_bytes(&*v)?;
+            return Ok(state
+                .get_region()
+                .get_peers()
+                .iter()
+                .map(|p| p.get_id())
+                .collect());
+        }
+        _ => Err(Error::Store(StorageError::Unavailable)),
     }
 }
 

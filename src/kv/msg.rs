@@ -1,20 +1,27 @@
 use super::storage::RockSnapshot;
 use bytes::Bytes;
 use futures::channel::mpsc::Sender;
+use protobuf::{CodedInputStream, CodedOutputStream};
 use raft::eraftpb::Message;
 use std::fmt::{self, Debug};
 
 pub enum Command {
     Put { key: Bytes, value: Bytes },
     UpdateAddress { id: u64, address: String },
+    BatchPut { kvs: Vec<(Bytes, Bytes)> },
 }
 
 impl Command {
     const PUT_SHORT_KEY: u8 = 0x01;
     const UPDATE_ADDRESS: u8 = 0x02;
+    const BATCH_PUT_KEY: u8 = 0x03;
 
     pub fn put(key: Bytes, value: Bytes) -> Command {
         Command::Put { key, value }
+    }
+
+    pub fn batch_put(kvs: Vec<(Bytes, Bytes)>) -> Command {
+        Command::BatchPut { kvs }
     }
 
     pub fn into_proposal(self) -> (Vec<u8>, Vec<u8>) {
@@ -28,6 +35,10 @@ impl Command {
                 p.extend_from_slice(address.as_bytes());
                 p.extend_from_slice(&id.to_le_bytes());
                 p.push(Command::UPDATE_ADDRESS);
+                (vec![], p)
+            }
+            Command::BatchPut { kvs } => {
+                let p = batch_put_proposal(&kvs);
                 (vec![], p)
             }
         }
@@ -55,6 +66,17 @@ impl Command {
                 let address = String::from_utf8(proposal.to_vec()).unwrap();
                 Some(Command::UpdateAddress { id, address })
             }
+            Command::BATCH_PUT_KEY => {
+                let bytes = proposal.slice(..proposal.len() - 1);
+                let mut input = CodedInputStream::from_carllerche_bytes(&bytes);
+                let mut kvs = Vec::new();
+                while !input.eof().unwrap() {
+                    let key = input.read_carllerche_bytes().unwrap();
+                    let value = input.read_carllerche_bytes().unwrap();
+                    kvs.push((key, value));
+                }
+                Some(Command::BatchPut { kvs })
+            }
             prefix => panic!("unrecognize command type {}", prefix),
         }
     }
@@ -63,7 +85,7 @@ impl Command {
 pub enum Res {
     Success,
     Snapshot(RockSnapshot),
-    RoleInfo { term: u64, leader: u64 },
+    RoleInfo { term: u64, leader: u64, my_id: u64 },
     Fail(String),
 }
 
@@ -72,16 +94,28 @@ impl Debug for Res {
         match self {
             Res::Success => write!(formatter, "Res::Success"),
             Res::Snapshot(_) => write!(formatter, "Res::Snapshot"),
-            Res::RoleInfo { term, leader } => {
+            Res::RoleInfo {
+                term,
+                leader,
+                my_id,
+            } => {
                 write!(
                     formatter,
-                    "Res::RoleInfo {{ term: {}, leader: {} }}",
-                    term, leader
+                    "Res::RoleInfo {{ term: {}, leader: {}, my_id: {} }}",
+                    term, leader, my_id
                 )
             }
             Res::Fail(s) => write!(formatter, "Res::Fail({:?})", s),
         }
     }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+pub enum Event {
+    Elected,
+    BecameLeader,
+    CommittedToCurrentTerm,
+    CommittedToCurrentTermAsLeader,
 }
 
 pub enum Msg {
@@ -94,9 +128,8 @@ pub enum Msg {
         term: Option<u64>,
         notifier: Sender<Res>,
     },
-    WaitTillElected {
-        leader: bool,
-        commit_to_current_term: bool,
+    WaitEvent {
+        event: Event,
         notifier: Sender<Res>,
     },
     RaftMessage(Message),
@@ -134,6 +167,17 @@ impl Msg {
             notifier,
         }
     }
+}
+
+fn batch_put_proposal(kvs: &[(Bytes, Bytes)]) -> Vec<u8> {
+    let mut res = Vec::new();
+    let mut s = CodedOutputStream::new(&mut res);
+    for (k, v) in kvs {
+        s.write_bytes_no_tag(k).unwrap();
+        s.write_bytes_no_tag(v).unwrap();
+    }
+    res.push(Command::BATCH_PUT_KEY);
+    res
 }
 
 fn put_proposal(key: &[u8], val: Bytes) -> Vec<u8> {

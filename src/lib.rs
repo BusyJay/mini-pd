@@ -1,10 +1,12 @@
+mod allocator;
+mod cluster;
 mod config;
 mod error;
 mod kv;
 mod net;
-mod tso;
 
+pub use cluster::stats::{PeerState, Region, Store};
 pub use config::Config;
 pub use error::{Error, Result};
-pub use kv::{AddressMap, Command, Msg, Res};
+pub use kv::{AddressMap, Command, Event, Msg, Res};
 pub use net::Server;

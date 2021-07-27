@@ -38,9 +38,8 @@ async fn test_multi_node() {
     let (tx, mut rx) = mpsc::channel(10);
 
     sender
-        .send(Msg::WaitTillElected {
-            leader: false,
-            commit_to_current_term: false,
+        .send(Msg::WaitEvent {
+            event: Event::Elected,
             notifier: tx.clone(),
         })
         .unwrap();

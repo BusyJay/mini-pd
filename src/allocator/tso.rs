@@ -1,3 +1,10 @@
+use crate::{kv::Event, Command, Error, Msg, Res, Result};
+use bytes::{BufMut, Bytes, BytesMut};
+use crossbeam::channel::Sender;
+use futures::{channel::mpsc, StreamExt};
+use futures_timer::Delay;
+use kvproto::pdpb::Timestamp;
+use slog::{debug, error, info, Logger};
 use std::{
     convert::TryInto,
     sync::{
@@ -6,26 +13,26 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-
-use crate::{Command, Error, Msg, Res, Result};
-use bytes::{BufMut, Bytes, BytesMut};
-use crossbeam::channel::Sender;
-use futures::{channel::mpsc, StreamExt};
-use futures_timer::Delay;
-use slog::{debug, error, info, Logger};
 use yatp::{task::future::TaskCell, Remote};
 
 static TSO_KEY: Bytes = Bytes::from_static(b"dtso");
 const TSO_LIMIT_STEP: Duration = Duration::from_secs(4);
 const TSO_LIMIT_SLEEP: Duration = Duration::from_secs(3);
+const PHYSICAL_OFFSET: u64 = 18;
+const LOGICAL_MASK: u64 = (1 << PHYSICAL_OFFSET) - 1;
 
 fn make_tso() -> u64 {
     let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    (dur.as_millis() as u64) << 18
+    (dur.as_millis() as u64) << PHYSICAL_OFFSET
 }
 
 fn delay_tso(tso: u64, time: Duration) -> u64 {
-    tso + ((time.as_millis() as u64) << 18)
+    tso + ((time.as_millis() as u64) << PHYSICAL_OFFSET)
+}
+
+pub fn fill_timestamp(tso: u64, ts: &mut Timestamp) {
+    ts.set_physical((tso >> PHYSICAL_OFFSET) as i64);
+    ts.set_logical((tso & LOGICAL_MASK) as i64);
 }
 
 struct TsoWatcher {
@@ -36,9 +43,8 @@ struct TsoWatcher {
 
 impl TsoWatcher {
     async fn init_tso_limit(&mut self) -> Option<(u64, Option<u64>)> {
-        let msg = Msg::WaitTillElected {
-            leader: true,
-            commit_to_current_term: true,
+        let msg = Msg::WaitEvent {
+            event: Event::CommittedToCurrentTermAsLeader,
             notifier: self.tx.clone(),
         };
         self.allocator.sender.send(msg).unwrap();

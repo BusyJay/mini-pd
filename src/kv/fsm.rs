@@ -1,5 +1,5 @@
 use super::storage::{self, address_key, valid_data_key};
-use super::{Command, InvokeContext, Msg, RaftClient, Res, RockStorage};
+use super::{Command, Event, InvokeContext, Msg, RaftClient, Res, RockStorage};
 use crate::{r, Config, Result};
 use crossbeam::channel::{self, Receiver, RecvTimeoutError, Sender, TrySendError};
 use futures::channel::mpsc;
@@ -36,9 +36,8 @@ struct Notifiers {
     // for simplicity.
     read_states: HashMap<u64, ReadRequest>,
     read_queue: BTreeMap<u64, Vec<mpsc::Sender<Res>>>,
-    wait_elected: Vec<mpsc::Sender<Res>>,
-    wait_leader: Vec<mpsc::Sender<Res>>,
-    wait_commit: Vec<mpsc::Sender<Res>>,
+    wait_event: HashMap<Event, Vec<mpsc::Sender<Res>>>,
+    wait_write: Vec<(mpsc::Sender<Res>, Res)>,
 }
 
 pub struct Fsm {
@@ -142,9 +141,14 @@ impl Fsm {
         let db = self.node.store().db();
         let mut iter = db.iter_opt(opt);
         if iter.seek(SeekKey::Key(&address_key(0))).unwrap() {
-            let id = u64::from_be_bytes(iter.key()[1..].try_into().unwrap());
-            let addr = String::from_utf8(iter.value().to_vec()).unwrap();
-            address.insert(id, addr);
+            loop {
+                let id = u64::from_be_bytes(iter.key()[1..].try_into().unwrap());
+                let addr = String::from_utf8(iter.value().to_vec()).unwrap();
+                address.insert(id, addr);
+                if !iter.next().unwrap() {
+                    break;
+                }
+            }
         }
     }
 
@@ -154,6 +158,10 @@ impl Fsm {
 
     pub fn id(&self) -> u64 {
         self.node.store().id()
+    }
+
+    pub fn db(&self) -> Arc<DB> {
+        self.db.clone()
     }
 
     fn schedule_tick(&mut self) {
@@ -187,6 +195,14 @@ impl Fsm {
                 .proposal_queue
                 .pop_front()
                 .map(|p| p.notifier);
+        }
+    }
+
+    fn role_info(&self) -> Res {
+        Res::RoleInfo {
+            leader: self.node.raft.leader_id,
+            term: self.node.raft.term,
+            my_id: self.id(),
         }
     }
 
@@ -250,23 +266,28 @@ impl Fsm {
                     .read_states
                     .insert(state, ReadRequest { notifier, start });
             }
-            Msg::WaitTillElected {
-                leader,
-                commit_to_current_term,
+            Msg::WaitEvent {
+                event,
                 mut notifier,
             } => {
                 let leader_id = self.node.raft.leader_id;
-                if leader_id != 0 && (!leader || leader_id == self.id()) {
-                    let _ = notifier.try_send(Res::RoleInfo {
-                        term: self.node.raft.term,
-                        leader: leader_id,
-                    });
-                } else if commit_to_current_term {
-                    self.notifiers.wait_commit.push(notifier);
-                } else if leader {
-                    self.notifiers.wait_leader.push(notifier);
+                if leader_id != INVALID_ID {
+                    if event == Event::Elected
+                        || event == Event::BecameLeader && leader_id == self.id()
+                        || event == Event::CommittedToCurrentTerm
+                            && self.node.raft.commit_to_current_term()
+                        || event == Event::CommittedToCurrentTermAsLeader
+                            && leader_id == self.id()
+                            && self.node.raft.commit_to_current_term()
+                    {
+                        let _ = notifier.try_send(self.role_info());
+                    }
                 } else {
-                    self.notifiers.wait_elected.push(notifier);
+                    self.notifiers
+                        .wait_event
+                        .entry(event)
+                        .or_default()
+                        .push(notifier);
                 }
             }
             Msg::RaftMessage(msg) => {
@@ -310,9 +331,22 @@ impl Fsm {
                     self.raft_client.address_map().lock().insert(id, address);
                     Res::Success
                 }
+                Some(Command::BatchPut { kvs }) => {
+                    match kvs.iter().find(|(key, _)| valid_data_key(&key)) {
+                        None => {
+                            for (key, value) in kvs {
+                                if let Err(e) = self.write_batch.put(&*key, &*value) {
+                                    panic!("unable to apply command: {:?}", e);
+                                }
+                            }
+                            Res::Success
+                        }
+                        Some((key, _)) => Res::Fail(format!("invalid key {:?}", key)),
+                    }
+                }
             };
-            if let Some(mut notifier) = self.get_notifier(index, term) {
-                let _ = notifier.try_send(res);
+            if let Some(notifier) = self.get_notifier(index, term) {
+                self.notifiers.wait_write.push((notifier, res));
             }
         }
         applied_index
@@ -358,35 +392,49 @@ impl Fsm {
 
     fn notify_role_changed(&mut self) {
         let leader_id = self.node.raft.leader_id;
-        let term = self.node.raft.term;
-        if leader_id != INVALID_ID {
-            if !self.notifiers.wait_elected.is_empty() {
-                for mut ob in self.notifiers.wait_elected.drain(..) {
-                    let _ = ob.try_send(Res::RoleInfo {
-                        leader: leader_id,
-                        term,
-                    });
+        if self.notifiers.wait_event.is_empty() || leader_id == INVALID_ID {
+            return;
+        }
+
+        if let Some(notifiers) = self.notifiers.wait_event.remove(&Event::Elected) {
+            for mut ob in notifiers {
+                let _ = ob.try_send(self.role_info());
+            }
+        }
+        if leader_id == self.id() {
+            if let Some(notifiers) = self.notifiers.wait_event.remove(&Event::BecameLeader) {
+                for mut ob in notifiers {
+                    let _ = ob.try_send(self.role_info());
                 }
             }
-            if leader_id == self.id() {
-                if !self.notifiers.wait_leader.is_empty() {
-                    for mut ob in self.notifiers.wait_leader.drain(..) {
-                        let _ = ob.try_send(Res::RoleInfo {
-                            leader: leader_id,
-                            term,
-                        });
-                    }
-                }
-                if !self.notifiers.wait_commit.is_empty() && self.node.raft.commit_to_current_term()
+            if self.node.raft.commit_to_current_term() {
+                if let Some(notifiers) = self
+                    .notifiers
+                    .wait_event
+                    .remove(&Event::CommittedToCurrentTermAsLeader)
                 {
-                    for mut ob in self.notifiers.wait_commit.drain(..) {
-                        let _ = ob.try_send(Res::RoleInfo {
-                            leader: leader_id,
-                            term,
-                        });
+                    for mut ob in notifiers {
+                        let _ = ob.try_send(self.role_info());
                     }
                 }
             }
+        }
+        if self.node.raft.commit_to_current_term() {
+            if let Some(notifiers) = self
+                .notifiers
+                .wait_event
+                .remove(&Event::CommittedToCurrentTerm)
+            {
+                for mut ob in notifiers {
+                    let _ = ob.try_send(self.role_info());
+                }
+            }
+        }
+    }
+
+    fn notify_applied(&mut self) {
+        for (mut n, r) in self.notifiers.wait_write.drain(..) {
+            let _ = n.try_send(r);
         }
     }
 
@@ -433,6 +481,9 @@ impl Fsm {
             }
             self.write_batch.clear();
             self.node.advance_append_async(ready);
+            // Don't need to wait syncing here. If the node is crash and restarted,
+            // ReadIndex will make sure all pending entries must be seen.
+            self.notify_applied();
         }
         self.has_ready = false;
         if self.unsynced_data_size >= 512 * 1024
@@ -451,7 +502,8 @@ impl Fsm {
                     info!(self.logger, "syncing WAL takes {:?}", d);
                 }
             }
-            self.last_sync_time = after_sync;
+            // If syncing is slow enough, it's unnecessary need to delay.
+            self.last_sync_time = start;
             self.unsynced_data_size = 0;
             self.node.on_persist_ready(self.last_ready_number);
             self.has_ready = true;

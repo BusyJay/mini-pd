@@ -1,10 +1,12 @@
 use super::service::{PdService, RaftService};
+use crate::allocator::Allocator;
+use crate::cluster::Cluster;
 use crate::kv::{AddressMap, Fsm, Msg, RaftClient};
-use crate::tso::TsoAllocator;
 use crate::{Config, Error, Result};
 use crossbeam::channel::Sender;
 use grpcio::{EnvBuilder, Environment};
 use kvproto::{minipdpb, pdpb};
+use rocksdb::DB;
 use slog::Logger;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -14,6 +16,7 @@ use yatp::ThreadPool;
 pub struct FsmHandle {
     id: u64,
     sender: Sender<Msg>,
+    db: Arc<DB>,
     env: Arc<Environment>,
     thread: JoinHandle<()>,
 }
@@ -68,6 +71,7 @@ impl Server {
         let mut fsm = Fsm::new(&self.config, raft_client, &self.logger, remote.clone())?;
         let sender = fsm.sender();
         let id = fsm.id();
+        let db = fsm.db();
         let thread = thread::Builder::new()
             .name("raft".to_owned())
             .spawn(move || {
@@ -79,6 +83,7 @@ impl Server {
         self.handle = Some(FsmHandle {
             id,
             sender,
+            db,
             env: raft_env,
             thread,
         });
@@ -104,12 +109,23 @@ impl Server {
         let raft_service = RaftService::new(handle.id, handle.sender.clone(), self.logger.clone());
         let raft_service = minipdpb::create_mini_pd_raft(raft_service);
 
-        let tso = TsoAllocator::new(
+        let tso = Allocator::new(
             handle.sender.clone(),
             self.pool.remote(),
             self.logger.clone(),
         );
-        let pd_service = PdService::new(tso, self.pool.remote().clone(), self.logger.clone());
+        let cluster = Cluster::new(
+            handle.sender.clone(),
+            self.pool.remote(),
+            self.logger.clone(),
+        );
+        let pd_service = PdService::new(
+            tso,
+            cluster,
+            handle.db.clone(),
+            self.pool.remote().clone(),
+            self.logger.clone(),
+        );
         let pd_service = pdpb::create_pd(pd_service);
 
         let (host, port) = self.get_bind_pair()?;

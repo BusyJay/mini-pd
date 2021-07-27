@@ -4,7 +4,7 @@ use futures::{channel::mpsc, join, SinkExt, StreamExt};
 use futures_timer::Delay;
 use grpcio::{ChannelBuilder, Environment, WriteFlags};
 use kvproto::{pdpb::TsoRequest, pdpb_grpc::PdClient};
-use mini_pd::{Msg, Res};
+use mini_pd::{Event, Msg, Res};
 
 use crate::cluster::Cluster;
 
@@ -28,9 +28,8 @@ async fn test_tso() {
 
     let (tx, mut rx) = mpsc::channel(10);
     sender
-        .send(Msg::WaitTillElected {
-            leader: false,
-            commit_to_current_term: false,
+        .send(Msg::WaitEvent {
+            event: Event::CommittedToCurrentTerm,
             notifier: tx.clone(),
         })
         .unwrap();
@@ -39,7 +38,7 @@ async fn test_tso() {
         res => panic!("failed to wait for election finish: {:?}", res),
     };
 
-    Delay::new(Duration::from_millis(10)).await;
+    Delay::new(Duration::from_millis(100)).await;
     addr = cluster.server(leader).advertise_address();
     let channel = ChannelBuilder::new(env.clone()).connect(addr);
     channel.wait_for_connected(Duration::from_secs(10)).await;
@@ -61,8 +60,10 @@ async fn test_tso() {
         for b in batch {
             let resp = rx.next().await.unwrap().unwrap();
             assert_eq!(resp.get_count(), *b, "{:?}", resp);
-            assert_ne!(resp.get_timestamp().get_logical(), last_ts, "{:?}", resp);
-            last_ts = resp.get_timestamp().get_logical();
+            let ts = resp.get_timestamp();
+            let ts = ts.get_physical() << 18 | ts.get_logical();
+            assert_ne!(ts, last_ts, "{:?}", resp);
+            last_ts = ts;
         }
         let res = rx.next().await;
         assert!(res.is_none(), "{:?}", res);
