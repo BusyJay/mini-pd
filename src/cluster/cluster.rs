@@ -6,15 +6,14 @@ use futures::{
 };
 use futures_timer::Delay;
 use kvproto::{
-    metapb::{self, StoreState},
+    metapb,
     pdpb::{self, Member, RegionHeartbeatRequest, RegionHeartbeatResponse, StoreStats},
 };
 use parking_lot::Mutex;
 use protobuf::Message;
-use rocksdb::{DBIterator, ReadOptions, SeekKey, DB};
 use slog::{error, info, Logger};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     convert::TryInto,
     mem,
     sync::{
@@ -25,16 +24,11 @@ use std::{
 };
 use yatp::{task::future::TaskCell, Remote};
 
-use crate::{cluster::events::RegionEvent, kv::RockSnapshot};
+use crate::cluster::events::RegionEvent;
 use crate::{kv, Command, Error, Event, Msg, Res, Result};
 
+use super::codec::*;
 use super::{events::RegionEventListeners, stats::RegionStats};
-
-const CLUSTER_ID_KEY: Bytes = Bytes::from_static(b"dcluster");
-const CLUSTER_BOOTSTRAP_KEY: Bytes = Bytes::from_static(b"dcluster_bootstrap");
-
-static REGION_KEY_PREFIX: &[u8] = b"dr";
-static STORE_KEY_PREFIX: &[u8] = b"ds";
 
 const NOT_BOOTSTRAP: u8 = 0x01;
 pub const BOOTSTRAPPING: u8 = 0x02;
@@ -46,99 +40,6 @@ fn new_member(id: u64, addr: String) -> Member {
     member.mut_peer_urls().push(addr.clone());
     member.mut_client_urls().push(addr);
     member
-}
-
-fn region_key(id: u64) -> Bytes {
-    kv::combine_key(REGION_KEY_PREFIX, id)
-}
-
-fn store_key(id: u64) -> Bytes {
-    kv::combine_key(STORE_KEY_PREFIX, id)
-}
-
-pub fn load_store(db: &DB, id: u64, store: &mut metapb::Store) -> Result<()> {
-    let key = store_key(id);
-    match kv::get_msg(db, &key)? {
-        Some(s) => {
-            *store = s;
-            Ok(())
-        }
-        None => Err(Error::Other("store not found".to_string())),
-    }
-}
-
-fn iter_all_store(snap: &RockSnapshot) -> DBIterator<&DB> {
-    let end_key = store_key(u64::MAX);
-    let mut opt = ReadOptions::default();
-    opt.set_iterate_upper_bound(end_key.to_vec());
-    snap.iter_opt(opt)
-}
-
-pub fn load_all_stores(snap: &RockSnapshot) -> Result<Vec<metapb::Store>> {
-    let mut iter = iter_all_store(snap);
-    let mut stores = Vec::with_capacity(3);
-    let start_key = store_key(0);
-    if iter.seek(SeekKey::Key(&start_key)).unwrap() {
-        loop {
-            let mut store = metapb::Store::default();
-            store.merge_from_bytes(iter.value())?;
-            stores.push(store);
-            if !iter.next().unwrap() {
-                break;
-            }
-        }
-    }
-    Ok(stores)
-}
-
-pub fn load_all_regions(snap: &RockSnapshot) -> Result<Vec<metapb::Region>> {
-    let start_key = region_key(0);
-    let end_key = region_key(u64::MAX);
-    let mut opt = ReadOptions::default();
-    opt.set_iterate_upper_bound(end_key.to_vec());
-    let mut iter = snap.iter_opt(opt);
-    let mut regions = Vec::with_capacity(4096);
-    if iter.seek(SeekKey::Key(&start_key)).unwrap() {
-        loop {
-            let mut region = metapb::Region::default();
-            region.merge_from_bytes(iter.value())?;
-            regions.push(region);
-            if !iter.next().unwrap() {
-                break;
-            }
-        }
-    }
-    Ok(regions)
-}
-
-pub fn get_cluster_version(snap: &RockSnapshot) -> Result<String> {
-    let mut iter = iter_all_store(snap);
-    let start_key = store_key(0);
-    if iter.seek(SeekKey::Key(&start_key)).unwrap() {
-        loop {
-            let mut store = metapb::Store::default();
-            store.merge_from_bytes(iter.value())?;
-            if store.get_state() != StoreState::Tombstone {
-                // TODO: correct way should use lease version.
-                return Ok(store.take_version());
-            }
-            if !iter.next().unwrap() {
-                break;
-            }
-        }
-    }
-    Err(Error::Other("version not found".to_string()))
-}
-
-pub fn load_region(db: &DB, id: u64, region: &mut metapb::Region) -> Result<()> {
-    let key = region_key(id);
-    match kv::get_msg(db, &key)? {
-        Some(s) => {
-            *region = s;
-            Ok(())
-        }
-        None => Err(Error::Other("region not found".to_string())),
-    }
 }
 
 async fn bootstrap(cluster: Cluster) {
@@ -244,16 +145,11 @@ async fn reload_cluser_meta(cluster: Cluster) {
     }
 }
 
-// id, version
-type RegionRef = (u64, u64);
-
 pub struct ClusterMeta {
     id: AtomicU64,
     bootstrap: AtomicU8,
     regions: Mutex<HashMap<u64, RegionStats>>,
     stores: Mutex<HashMap<u64, StoreStats>>,
-    // Double Arc to allow cheap copy and short lock.
-    range_caches: Mutex<Arc<BTreeMap<Vec<u8>, (u64, u64)>>>,
     region_caches: Mutex<HashMap<u64, metapb::Region>>,
     store_scheduler: Mutex<HashMap<u64, Sender<RegionHeartbeatResponse>>>,
     region_event_hub: Mutex<HashMap<u64, RegionEventListeners>>,
@@ -275,10 +171,6 @@ impl ClusterMeta {
 
     pub fn regions(&self) -> &Mutex<HashMap<u64, RegionStats>> {
         &self.regions
-    }
-
-    pub fn get_region_cache(&self, id: u64) -> Option<metapb::Region> {
-        self.region_caches.lock().get(&id).cloned()
     }
 }
 
@@ -303,7 +195,7 @@ impl BootstrapGuard {
         let kvs = vec![
             (CLUSTER_BOOTSTRAP_KEY, buffer.into()),
             (
-                region_key(region.get_id()),
+                Bytes::copy_from_slice(&region_key(region.get_id())),
                 region.write_length_delimited_to_bytes().unwrap().into(),
             ),
         ];
@@ -348,7 +240,6 @@ impl Cluster {
                 bootstrap: AtomicU8::new(NOT_BOOTSTRAP),
                 regions: Default::default(),
                 stores: Default::default(),
-                range_caches: Default::default(),
                 region_caches: Default::default(),
                 store_scheduler: Default::default(),
                 region_event_hub: Default::default(),
@@ -439,7 +330,7 @@ impl Cluster {
     pub async fn put_store(&self, store: metapb::Store) -> Result<()> {
         let (tx, mut rx) = mpsc::channel(1);
         // TODO: check address, state.
-        let key = store_key(store.get_id());
+        let key = Bytes::copy_from_slice(&store_key(store.get_id()));
         let value = store.write_to_bytes().unwrap().into();
         let put = Command::put(key, value);
         let msg = Msg::command(put, Some(tx.clone()));
@@ -461,10 +352,6 @@ impl Cluster {
 
     pub fn regions(&self) -> &Mutex<HashMap<u64, RegionStats>> {
         self.meta.regions()
-    }
-
-    pub fn range_caches(&self) -> &Mutex<Arc<BTreeMap<Vec<u8>, RegionRef>>> {
-        &self.meta.range_caches
     }
 
     pub fn register_region_stream(
@@ -489,7 +376,7 @@ impl Cluster {
                     break;
                 }
             }
-            let mut cached = meta.region_caches.lock();
+            let mut region_cached = meta.region_caches.lock();
             let mut stats = meta.regions.lock();
             for heartbeat in &mut batch {
                 let region_id = heartbeat.get_region().get_id();
@@ -500,10 +387,10 @@ impl Cluster {
                 let mut hub = meta.region_event_hub.lock();
                 let mut listeners = hub.get_mut(&region_id);
                 let region = heartbeat.take_region();
-                let cached_region = cached.get(&region_id);
+                let cached_region = region_cached.get(&region_id);
                 if cached_region.map_or(true, |r| stale_region(r, &region)) {
                     updates.push((
-                        region_key(region.get_id()),
+                        Bytes::copy_from_slice(&region_key(region.get_id())),
                         region.write_to_bytes().unwrap().into(),
                     ));
                     if let Some(listeners) = &mut listeners {
@@ -513,13 +400,26 @@ impl Cluster {
                             });
                         }
                     }
-                    cached.insert(region.get_id(), region);
+                    if let Some(r) = &cached_region {
+                        let origin_ver = r.get_region_epoch().get_version();
+                        let cur_ver = region.get_region_epoch().get_version();
+                        if origin_ver != cur_ver {
+                            let origin_key = region_range_key(r.get_end_key(), origin_ver);
+                            updates.push((origin_key, Bytes::new()));
+                            let cur_key = region_range_key(region.get_end_key(), cur_ver);
+                            let val = region_range_value(region_id);
+                            updates.push((cur_key, val));
+                        }
+                    }
+                    region_cached.insert(region.get_id(), region);
                 }
                 stats.refresh_with(heartbeat, listeners);
             }
-            drop(cached);
+            drop(region_cached);
             drop(stats);
             batch.clear();
+            // This is not technically correct as it doesn't check if caches match physical
+            // storage. But it will eventually correct as heartbeat will keep being reported.
             if !updates.is_empty() {
                 let cmd = Command::batch_put(updates);
                 let _ = sender.try_send(Msg::command(cmd, None));
@@ -540,7 +440,7 @@ impl Cluster {
             let cached_region = cached.get(&region_id);
             if cached_region.map_or(true, |r| stale_region(r, &region)) {
                 updates.push((
-                    region_key(region.get_id()),
+                    Bytes::copy_from_slice(&region_key(region.get_id())),
                     region.write_to_bytes().unwrap().into(),
                 ));
                 if let Some(listeners) = &mut listeners {
@@ -548,6 +448,17 @@ impl Cluster {
                         let _ = l.try_send(RegionEvent::RegionChanged {
                             region: region.clone(),
                         });
+                    }
+                }
+                if let Some(r) = &cached_region {
+                    let origin_ver = r.get_region_epoch().get_version();
+                    let cur_ver = region.get_region_epoch().get_version();
+                    if origin_ver != cur_ver {
+                        let origin_key = region_range_key(r.get_end_key(), origin_ver);
+                        updates.push((origin_key, Bytes::new()));
+                        let cur_key = region_range_key(region.get_end_key(), cur_ver);
+                        let val = region_range_value(region_id);
+                        updates.push((cur_key, val));
                     }
                 }
                 cached.insert(region.get_id(), region);

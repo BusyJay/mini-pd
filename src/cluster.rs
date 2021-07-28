@@ -1,8 +1,7 @@
 mod cluster;
+pub mod codec;
 pub mod events;
+pub mod query;
 pub mod stats;
 
-pub use cluster::{
-    get_cluster_version, load_all_stores, load_region, load_store, Cluster, ClusterMeta,
-    BOOTSTRAPPED, BOOTSTRAPPING,
-};
+pub use cluster::{Cluster, ClusterMeta, BOOTSTRAPPED, BOOTSTRAPPING};

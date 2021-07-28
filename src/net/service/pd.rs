@@ -1,5 +1,5 @@
 use crate::allocator::{self, Allocator};
-use crate::cluster::{self, Cluster, ClusterMeta, BOOTSTRAPPING};
+use crate::cluster::{query, Cluster, ClusterMeta, BOOTSTRAPPING};
 use crate::kv::{RockSnapshot, RockSnapshotFactory};
 use crate::Error;
 use futures::channel::mpsc;
@@ -11,10 +11,11 @@ use kvproto::pdpb::{self, *};
 use rocksdb::DB;
 use slog::{error, Logger};
 use std::cmp;
-use std::ops::Bound::*;
 use std::sync::Arc;
 use yatp::task::future::TaskCell;
 use yatp::Remote;
+
+// TODO: rocksdb operation may block, and should not be executed inside grpc threads.
 
 fn new_tso_response(cluster_id: u64, count: u64, start: &mut u64) -> TsoResponse {
     let mut resp = TsoResponse::default();
@@ -129,17 +130,17 @@ impl PdService {
     fn get_region_by_id_impl(
         &self,
         ctx: RpcContext,
-        id: Option<u64>,
+        region: Option<metapb::Region>,
         mut resp: GetRegionResponse,
         sink: UnarySink<GetRegionResponse>,
     ) {
-        if let Some(id) = id {
-            if cluster::load_region(&self.db, id, resp.mut_region()).is_ok() {
-                if let Some(stats) = self.cluster.regions().lock().get(&id) {
-                    resp.set_leader(stats.leader.clone());
-                    resp.set_down_peers(stats.down_peers.clone().into());
-                    resp.set_pending_peers(stats.pending_peers.clone().into());
-                }
+        if let Some(r) = region {
+            let region_id = r.get_id();
+            resp.set_region(r);
+            if let Some(stats) = self.cluster.regions().lock().get(&region_id) {
+                resp.set_leader(stats.leader.clone());
+                resp.set_down_peers(stats.down_peers.clone().into());
+                resp.set_pending_peers(stats.pending_peers.clone().into());
             }
         }
         if !resp.get_region().has_region_epoch() {
@@ -157,27 +158,18 @@ impl PdService {
     fn get_region_impl(
         &mut self,
         ctx: RpcContext,
-        mut req: GetRegionRequest,
+        req: GetRegionRequest,
         sink: UnarySink<GetRegionResponse>,
         reverse: bool,
     ) {
         let resp = check_bootstrap!(ctx, self.cluster, sink, req, GetRegionResponse);
-        let range_caches = self.cluster.range_caches().lock().clone();
-        let res = if !reverse {
-            range_caches
-                .range((Excluded(req.take_region_key()), Unbounded))
-                .next()
-        } else {
-            range_caches
-                .range((Unbounded, Included(req.take_region_key())))
-                .next_back()
-        };
-        self.get_region_by_id_impl(ctx, res.map(|r| r.1 .0), resp, sink);
+        let snap = self.db.build();
+        let region = query::get_region_by_key(&snap, req.get_region_key(), reverse);
+        self.get_region_by_id_impl(ctx, region, resp, sink);
     }
 
     fn get_split_id_count(&self, region: &metapb::Region, new_splits: u64) -> crate::Result<u64> {
-        let meta = self.cluster.meta();
-        let cached = meta.get_region_cache(region.get_id());
+        let cached = query::get_region_by_id(&self.db.build(), region.get_id());
         if cached.as_ref().map_or(true, |r| r != region) {
             return Err(Error::Other(format!("stale region, my {:?}", cached)));
         }
@@ -361,8 +353,15 @@ impl Pd for PdService {
     ) {
         let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, GetStoreResponse);
         let store_id = req.get_store_id();
-        if let Err(e) = cluster::load_store(&self.db, store_id, resp.mut_store()) {
-            fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e));
+        let store = query::load_store(&self.db.build(), store_id);
+        if let Some(s) = store {
+            resp.set_store(s);
+        } else {
+            fill_error(
+                resp.mut_header(),
+                ErrorType::UNKNOWN,
+                "store not found".to_string(),
+            );
         }
         ctx.spawn(async move {
             let _ = sink.success(resp);
@@ -394,9 +393,15 @@ impl Pd for PdService {
         sink: UnarySink<GetAllStoresResponse>,
     ) {
         let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, GetAllStoresResponse);
-        match cluster::load_all_stores(&RockSnapshot::new(self.db.clone())) {
-            Ok(stores) => resp.set_stores(stores.into()),
-            Err(e) => fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e)),
+        let stores = query::load_all_stores(&RockSnapshot::new(self.db.clone()));
+        if !stores.is_empty() {
+            resp.set_stores(stores.into());
+        } else {
+            fill_error(
+                resp.mut_header(),
+                ErrorType::UNKNOWN,
+                "no store found".to_string(),
+            );
         }
         ctx.spawn(async move {
             let _ = sink.success(resp);
@@ -412,7 +417,7 @@ impl Pd for PdService {
         let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, StoreHeartbeatResponse);
         self.cluster.update_store_stats(req.take_stats());
         // TODO: support cluster version.
-        if let Ok(version) = cluster::get_cluster_version(&self.db.build()) {
+        if let Some(version) = query::get_cluster_version(&self.db.build()) {
             resp.set_cluster_version(version);
         }
         ctx.spawn(async move {
@@ -504,28 +509,18 @@ impl Pd for PdService {
         sink: UnarySink<GetRegionResponse>,
     ) {
         let resp = check_bootstrap!(ctx, self.cluster, sink, req, GetRegionResponse);
-        self.get_region_by_id_impl(ctx, Some(req.get_region_id()), resp, sink)
+        let r = query::get_region_by_id(&self.db.build(), req.get_region_id());
+        self.get_region_by_id_impl(ctx, r, resp, sink)
     }
 
     fn scan_regions(
         &mut self,
         ctx: RpcContext,
-        mut req: ScanRegionsRequest,
+        req: ScanRegionsRequest,
         sink: UnarySink<ScanRegionsResponse>,
     ) {
         let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, ScanRegionsResponse);
-        let range_caches = self.cluster.range_caches().lock().clone();
-        let ranges =
-            range_caches.range((Excluded(req.take_start_key()), Included(req.take_end_key())));
-        let mut regions = Vec::with_capacity(64);
-        for (_, (id, _)) in ranges {
-            let mut region = metapb::Region::default();
-            if cluster::load_region(&self.db, *id, &mut region).is_ok() {
-                regions.push(region);
-            } else {
-                break;
-            }
-        }
+        let regions = query::scan_region(&self.db.build(), req.get_start_key(), req.get_end_key());
         if regions.is_empty() {
             fill_error(
                 resp.mut_header(),

@@ -1,6 +1,5 @@
 use super::AddressMap;
 use crate::r;
-use bytes::{BufMut, Bytes, BytesMut};
 use kvproto::metapb::{self, Peer, PeerRole};
 use kvproto::raft_serverpb::{RaftApplyState, RaftLocalState, RegionLocalState};
 use protobuf::Message;
@@ -32,13 +31,6 @@ impl RockSnapshotFactory for Arc<DB> {
     fn build(&self) -> RockSnapshot {
         RockSnapshot::new(self.clone())
     }
-}
-
-pub fn combine_key(prefix: &[u8], id: u64) -> Bytes {
-    let mut buf = BytesMut::with_capacity(prefix.len() + 8);
-    buf.put_slice(prefix);
-    buf.put_u64(id);
-    buf.freeze()
 }
 
 pub fn log_key(index: u64) -> [u8; 9] {

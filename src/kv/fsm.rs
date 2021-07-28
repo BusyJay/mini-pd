@@ -316,7 +316,12 @@ impl Fsm {
                 None => Res::Success,
                 Some(Command::Put { key, value }) => {
                     if valid_data_key(&key) {
-                        if let Err(e) = self.write_batch.put(&*key, &*value) {
+                        let res = if !value.is_empty() {
+                            self.write_batch.put(&*key, &*value)
+                        } else {
+                            self.write_batch.delete(&*key)
+                        };
+                        if let Err(e) = res {
                             panic!("unable to apply command: {:?}", e);
                         }
                         Res::Success
