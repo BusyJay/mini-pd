@@ -1,10 +1,13 @@
 use bytes::{BufMut, Bytes, BytesMut};
-use crossbeam::channel::Sender;
-use futures::{channel::mpsc, StreamExt};
+use crossbeam::channel;
+use futures::{
+    channel::mpsc::{self, Receiver, Sender},
+    StreamExt,
+};
 use futures_timer::Delay;
 use kvproto::{
     metapb::{self, StoreState},
-    pdpb::{self, Member, StoreStats},
+    pdpb::{self, Member, RegionHeartbeatRequest, RegionHeartbeatResponse, StoreStats},
 };
 use parking_lot::Mutex;
 use protobuf::Message;
@@ -13,6 +16,7 @@ use slog::{error, info, Logger};
 use std::{
     collections::{BTreeMap, HashMap},
     convert::TryInto,
+    mem,
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
         Arc,
@@ -21,10 +25,10 @@ use std::{
 };
 use yatp::{task::future::TaskCell, Remote};
 
-use crate::kv::RockSnapshot;
+use crate::{cluster::events::RegionEvent, kv::RockSnapshot};
 use crate::{kv, Command, Error, Event, Msg, Res, Result};
 
-use super::stats::RegionStats;
+use super::{events::RegionEventListeners, stats::RegionStats};
 
 const CLUSTER_ID_KEY: Bytes = Bytes::from_static(b"dcluster");
 const CLUSTER_BOOTSTRAP_KEY: Bytes = Bytes::from_static(b"dcluster_bootstrap");
@@ -250,6 +254,9 @@ pub struct ClusterMeta {
     stores: Mutex<HashMap<u64, StoreStats>>,
     // Double Arc to allow cheap copy and short lock.
     range_caches: Mutex<Arc<BTreeMap<Vec<u8>, (u64, u64)>>>,
+    region_caches: Mutex<HashMap<u64, metapb::Region>>,
+    store_scheduler: Mutex<HashMap<u64, Sender<RegionHeartbeatResponse>>>,
+    region_event_hub: Mutex<HashMap<u64, RegionEventListeners>>,
 }
 
 impl ClusterMeta {
@@ -268,6 +275,10 @@ impl ClusterMeta {
 
     pub fn regions(&self) -> &Mutex<HashMap<u64, RegionStats>> {
         &self.regions
+    }
+
+    pub fn get_region_cache(&self, id: u64) -> Option<metapb::Region> {
+        self.region_caches.lock().get(&id).cloned()
     }
 }
 
@@ -325,12 +336,12 @@ impl Drop for BootstrapGuard {
 #[derive(Clone)]
 pub struct Cluster {
     meta: Arc<ClusterMeta>,
-    sender: Sender<Msg>,
+    sender: channel::Sender<Msg>,
     logger: Logger,
 }
 
 impl Cluster {
-    pub fn new(sender: Sender<Msg>, remote: &Remote<TaskCell>, logger: Logger) -> Cluster {
+    pub fn new(sender: channel::Sender<Msg>, remote: &Remote<TaskCell>, logger: Logger) -> Cluster {
         let cluster = Cluster {
             meta: Arc::new(ClusterMeta {
                 id: AtomicU64::new(0),
@@ -338,6 +349,9 @@ impl Cluster {
                 regions: Default::default(),
                 stores: Default::default(),
                 range_caches: Default::default(),
+                region_caches: Default::default(),
+                store_scheduler: Default::default(),
+                region_event_hub: Default::default(),
             }),
             sender,
             logger,
@@ -452,4 +466,103 @@ impl Cluster {
     pub fn range_caches(&self) -> &Mutex<Arc<BTreeMap<Vec<u8>, RegionRef>>> {
         &self.meta.range_caches
     }
+
+    pub fn register_region_stream(
+        &self,
+        remote: &Remote<TaskCell>,
+        store_id: u64,
+        mut rx: Receiver<RegionHeartbeatRequest>,
+        tx: Sender<RegionHeartbeatResponse>,
+    ) {
+        let meta = self.meta.clone();
+        let sender = self.sender.clone();
+        let loop_update_region = async move {
+            let mut batch = Vec::with_capacity(100);
+            let mut updates = vec![];
+            match rx.next().await {
+                Some(r) => batch.push(r),
+                None => return,
+            };
+            while let Ok(Some(r)) = rx.try_next() {
+                batch.push(r);
+                if batch.len() == 100 {
+                    break;
+                }
+            }
+            let mut cached = meta.region_caches.lock();
+            let mut stats = meta.regions.lock();
+            for heartbeat in &mut batch {
+                let region_id = heartbeat.get_region().get_id();
+                let stats = stats.entry(region_id).or_default();
+                if stats.term > heartbeat.get_term() {
+                    continue;
+                }
+                let mut hub = meta.region_event_hub.lock();
+                let mut listeners = hub.get_mut(&region_id);
+                let region = heartbeat.take_region();
+                let cached_region = cached.get(&region_id);
+                if cached_region.map_or(true, |r| stale_region(r, &region)) {
+                    updates.push((
+                        region_key(region.get_id()),
+                        region.write_to_bytes().unwrap().into(),
+                    ));
+                    if let Some(listeners) = &mut listeners {
+                        for mut l in mem::take(&mut listeners.region_changed) {
+                            let _ = l.try_send(RegionEvent::RegionChanged {
+                                region: region.clone(),
+                            });
+                        }
+                    }
+                    cached.insert(region.get_id(), region);
+                }
+                stats.refresh_with(heartbeat, listeners);
+            }
+            drop(cached);
+            drop(stats);
+            batch.clear();
+            if !updates.is_empty() {
+                let cmd = Command::batch_put(updates);
+                let _ = sender.try_send(Msg::command(cmd, None));
+            }
+        };
+        remote.spawn(loop_update_region);
+        self.meta.store_scheduler.lock().insert(store_id, tx);
+    }
+
+    pub fn put_regions(&self, regions: Vec<metapb::Region>) {
+        let mut updates = Vec::with_capacity(regions.len());
+        let meta = &self.meta;
+        let mut cached = meta.region_caches.lock();
+        for region in regions {
+            let region_id = region.get_id();
+            let mut hub = meta.region_event_hub.lock();
+            let mut listeners = hub.get_mut(&region_id);
+            let cached_region = cached.get(&region_id);
+            if cached_region.map_or(true, |r| stale_region(r, &region)) {
+                updates.push((
+                    region_key(region.get_id()),
+                    region.write_to_bytes().unwrap().into(),
+                ));
+                if let Some(listeners) = &mut listeners {
+                    for mut l in mem::take(&mut listeners.region_changed) {
+                        let _ = l.try_send(RegionEvent::RegionChanged {
+                            region: region.clone(),
+                        });
+                    }
+                }
+                cached.insert(region.get_id(), region);
+            }
+        }
+        if !updates.is_empty() {
+            let cmd = Command::batch_put(updates);
+            let _ = self.sender.try_send(Msg::command(cmd, None));
+        }
+    }
+}
+
+fn stale_region(lhs: &metapb::Region, rhs: &metapb::Region) -> bool {
+    let lhs_epoch = lhs.get_region_epoch();
+    let rhs_epoch = rhs.get_region_epoch();
+    lhs_epoch.get_version() < rhs_epoch.get_version()
+        || lhs_epoch.get_conf_ver() < rhs_epoch.get_conf_ver()
 }

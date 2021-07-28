@@ -4,7 +4,7 @@ use crate::kv::{RockSnapshot, RockSnapshotFactory};
 use crate::Error;
 use futures::channel::mpsc;
 use futures::{join, prelude::*};
-use grpcio::{DuplexSink, WriteFlags};
+use grpcio::{DuplexSink, RpcStatus, RpcStatusCode, WriteFlags};
 use grpcio::{RequestStream, RpcContext, UnarySink};
 use kvproto::metapb;
 use kvproto::pdpb::{self, *};
@@ -49,26 +49,30 @@ fn fill_error(header: &mut ResponseHeader, et: ErrorType, msg: String) {
     header.mut_error().set_message(msg);
 }
 
+fn check_id(my_id: u64, req_header: &RequestHeader) -> Option<(ErrorType, String)> {
+    if my_id == 0 {
+        return Some((
+            ErrorType::NOT_BOOTSTRAPPED,
+            "still initializing cluster id".to_owned(),
+        ));
+    }
+    let req_id = req_header.get_cluster_id();
+    if req_id != 0 && req_id != my_id {
+        return Some((
+            ErrorType::UNKNOWN,
+            format!("cluster id not match, req_id {}, pd_id {}", req_id, my_id),
+        ));
+    }
+    None
+}
+
 macro_rules! check_cluster {
-    ($ctx:expr, $cluster:expr, $sink:ident, $req:ident, $resp:expr) => {{
+    ($ctx:expr, $cluster:expr, $sink:ident, $req:ident, $resp:ident) => {{
         let id = $cluster.id();
-        if id == 0 {
-            let mut resp = $resp;
-            fill_header_raw(resp.mut_header(), 0);
-            $ctx.spawn(async move {
-                let _ = $sink.success(resp).await;
-            });
-            return;
-        }
-        let request_id = $req.get_header().get_cluster_id();
-        let mut resp = $resp;
+        let mut resp = $resp::default();
         resp.mut_header().set_cluster_id(id);
-        if request_id != 0 && request_id != id {
-            fill_error(
-                resp.mut_header(),
-                ErrorType::UNKNOWN,
-                format!("cluster id not match, your {}, my {}", request_id, id),
-            );
+        if let Some((et, msg)) = check_id(id, $req.get_header()) {
+            fill_error(resp.mut_header(), et, msg);
             $ctx.spawn(async move {
                 let _ = $sink.success(resp).await;
             });
@@ -79,7 +83,7 @@ macro_rules! check_cluster {
 }
 
 macro_rules! check_bootstrap {
-    ($ctx:expr, $cluster:expr, $sink:ident, $req:ident, $resp:expr) => {{
+    ($ctx:expr, $cluster:expr, $sink:ident, $req:ident, $resp:ident) => {{
         let mut resp = check_cluster!($ctx, $cluster, $sink, $req, $resp);
         if !$cluster.is_bootstrapped() {
             fill_error(
@@ -131,12 +135,10 @@ impl PdService {
     ) {
         if let Some(id) = id {
             if cluster::load_region(&self.db, id, resp.mut_region()).is_ok() {
-                if let Some(stats) = self.cluster.regions().lock().get(&id).cloned() {
-                    if let Some(leader) = stats.leader {
-                        resp.set_leader(leader);
-                    }
-                    resp.set_down_peers(stats.down_peer.into());
-                    resp.set_pending_peers(stats.pending_peer.into());
+                if let Some(stats) = self.cluster.regions().lock().get(&id) {
+                    resp.set_leader(stats.leader.clone());
+                    resp.set_down_peers(stats.down_peers.clone().into());
+                    resp.set_pending_peers(stats.pending_peers.clone().into());
                 }
             }
         }
@@ -159,7 +161,7 @@ impl PdService {
         sink: UnarySink<GetRegionResponse>,
         reverse: bool,
     ) {
-        let resp = check_bootstrap!(ctx, self.cluster, sink, req, GetRegionResponse::default());
+        let resp = check_bootstrap!(ctx, self.cluster, sink, req, GetRegionResponse);
         let range_caches = self.cluster.range_caches().lock().clone();
         let res = if !reverse {
             range_caches
@@ -172,16 +174,26 @@ impl PdService {
         };
         self.get_region_by_id_impl(ctx, res.map(|r| r.1 .0), resp, sink);
     }
+
+    fn get_split_id_count(&self, region: &metapb::Region, new_splits: u64) -> crate::Result<u64> {
+        let meta = self.cluster.meta();
+        let cached = meta.get_region_cache(region.get_id());
+        if cached.as_ref().map_or(true, |r| r != region) {
+            return Err(Error::Other(format!("stale region, my {:?}", cached)));
+        }
+        let count = (region.get_peers().len() as u64 + 1) * new_splits;
+        Ok(count)
+    }
 }
 
 impl Pd for PdService {
     fn get_members(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         req: GetMembersRequest,
-        sink: ::grpcio::UnarySink<GetMembersResponse>,
+        sink: UnarySink<GetMembersResponse>,
     ) {
-        let mut resp = check_cluster!(ctx, self.cluster, sink, req, GetMembersResponse::default());
+        let mut resp = check_cluster!(ctx, self.cluster, sink, req, GetMembersResponse);
         let cluster = self.cluster.clone();
         let f = async move {
             match cluster.get_members().await {
@@ -278,11 +290,11 @@ impl Pd for PdService {
 
     fn bootstrap(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         req: BootstrapRequest,
-        sink: ::grpcio::UnarySink<BootstrapResponse>,
+        sink: UnarySink<BootstrapResponse>,
     ) {
-        let mut resp = check_cluster!(ctx, self.cluster, sink, req, BootstrapResponse::default());
+        let mut resp = check_cluster!(ctx, self.cluster, sink, req, BootstrapResponse);
         let mut guard = match self.cluster.lock_for_bootstrap() {
             Ok(guard) => guard,
             Err(e) => {
@@ -318,13 +330,7 @@ impl Pd for PdService {
         req: IsBootstrappedRequest,
         sink: UnarySink<IsBootstrappedResponse>,
     ) {
-        let mut resp = check_cluster!(
-            ctx,
-            self.cluster,
-            sink,
-            req,
-            IsBootstrappedResponse::default()
-        );
+        let mut resp = check_cluster!(ctx, self.cluster, sink, req, IsBootstrappedResponse);
         let bootstrapped = self.cluster.is_bootstrapped();
         resp.set_bootstrapped(bootstrapped);
         ctx.spawn(async move {
@@ -332,13 +338,8 @@ impl Pd for PdService {
         });
     }
 
-    fn alloc_id(
-        &mut self,
-        ctx: ::grpcio::RpcContext,
-        req: AllocIDRequest,
-        sink: ::grpcio::UnarySink<AllocIDResponse>,
-    ) {
-        let mut resp = check_cluster!(ctx, self.cluster, sink, req, AllocIDResponse::default());
+    fn alloc_id(&mut self, ctx: RpcContext, req: AllocIDRequest, sink: UnarySink<AllocIDResponse>) {
+        let mut resp = check_cluster!(ctx, self.cluster, sink, req, AllocIDResponse);
         let id = self.allocator.id().clone();
         let f = async move {
             match id.alloc(1).await {
@@ -354,11 +355,11 @@ impl Pd for PdService {
 
     fn get_store(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         req: GetStoreRequest,
-        sink: ::grpcio::UnarySink<GetStoreResponse>,
+        sink: UnarySink<GetStoreResponse>,
     ) {
-        let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, GetStoreResponse::default());
+        let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, GetStoreResponse);
         let store_id = req.get_store_id();
         if let Err(e) = cluster::load_store(&self.db, store_id, resp.mut_store()) {
             fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e));
@@ -370,11 +371,11 @@ impl Pd for PdService {
 
     fn put_store(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         mut req: PutStoreRequest,
-        sink: ::grpcio::UnarySink<PutStoreResponse>,
+        sink: UnarySink<PutStoreResponse>,
     ) {
-        let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, PutStoreResponse::default());
+        let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, PutStoreResponse);
         let cluster = self.cluster.clone();
         let store = req.take_store();
         let f = async move {
@@ -388,17 +389,11 @@ impl Pd for PdService {
 
     fn get_all_stores(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         req: GetAllStoresRequest,
-        sink: ::grpcio::UnarySink<GetAllStoresResponse>,
+        sink: UnarySink<GetAllStoresResponse>,
     ) {
-        let mut resp = check_bootstrap!(
-            ctx,
-            self.cluster,
-            sink,
-            req,
-            GetAllStoresResponse::default()
-        );
+        let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, GetAllStoresResponse);
         match cluster::load_all_stores(&RockSnapshot::new(self.db.clone())) {
             Ok(stores) => resp.set_stores(stores.into()),
             Err(e) => fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e)),
@@ -410,17 +405,11 @@ impl Pd for PdService {
 
     fn store_heartbeat(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         mut req: StoreHeartbeatRequest,
-        sink: ::grpcio::UnarySink<StoreHeartbeatResponse>,
+        sink: UnarySink<StoreHeartbeatResponse>,
     ) {
-        let mut resp = check_bootstrap!(
-            ctx,
-            self.cluster,
-            sink,
-            req,
-            StoreHeartbeatResponse::default()
-        );
+        let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, StoreHeartbeatResponse);
         self.cluster.update_store_stats(req.take_stats());
         // TODO: support cluster version.
         if let Ok(version) = cluster::get_cluster_version(&self.db.build()) {
@@ -433,49 +422,98 @@ impl Pd for PdService {
 
     fn region_heartbeat(
         &mut self,
-        ctx: ::grpcio::RpcContext,
-        _stream: ::grpcio::RequestStream<RegionHeartbeatRequest>,
-        sink: ::grpcio::DuplexSink<RegionHeartbeatResponse>,
+        ctx: RpcContext,
+        mut stream: RequestStream<RegionHeartbeatRequest>,
+        mut sink: DuplexSink<RegionHeartbeatResponse>,
     ) {
-        grpcio::unimplemented_call!(ctx, sink)
+        // TODO: check cluster id.
+        let logger = self.logger.clone();
+        let cluster = self.cluster.clone();
+        let remote = self.remote.clone();
+        let f = async move {
+            let req = match stream.try_next().await {
+                Ok(Some(req)) => req,
+                res => {
+                    error!(logger, "failed to receive first heartbeat: {:?}", res);
+                    let _ = sink
+                        .fail(RpcStatus::with_message(
+                            RpcStatusCode::UNKNOWN,
+                            format!("failed to receive heartbeat: {:?}", res),
+                        ))
+                        .await;
+                    return;
+                }
+            };
+            let id = cluster.id();
+            if let Some((et, msg)) = check_id(id, req.get_header()) {
+                let mut resp = RegionHeartbeatResponse::default();
+                resp.mut_header().set_cluster_id(id);
+                fill_error(resp.mut_header(), et, msg);
+                let _ = sink.send((resp, WriteFlags::default())).await;
+                let _ = sink.close().await;
+                return;
+            }
+
+            let (mut batch_tx, batch_rx) = mpsc::channel(1024);
+            let (sched_tx, sched_rx) = mpsc::channel::<RegionHeartbeatResponse>(1024);
+            let store_id = req.get_leader().get_store_id();
+            batch_tx.try_send(req).unwrap();
+            let collect = async move {
+                let mut wrap_stream = stream.map_err(Error::Rpc);
+                let mut wrap_tx =
+                    batch_tx.sink_map_err(|e| Error::Other(format!("failed to forward: {}", e)));
+                wrap_tx.send_all(&mut wrap_stream).await
+            };
+            let sched = async move {
+                let mut wrap_sched = sched_rx.map(|r| Ok((r, WriteFlags::default())));
+                let mut wrap_sink =
+                    sink.sink_map_err(|e| Error::Other(format!("failed to forward: {}", e)));
+                wrap_sink.send_all(&mut wrap_sched).await
+            };
+            cluster.register_region_stream(&remote, store_id, batch_rx, sched_tx);
+            let res = join!(collect, sched);
+            if res.0.is_err() || res.1.is_err() {
+                error!(logger, "failed to handle tso: {:?}", res);
+            }
+        };
+        ctx.spawn(f);
     }
 
     fn get_region(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         req: GetRegionRequest,
-        sink: ::grpcio::UnarySink<GetRegionResponse>,
+        sink: UnarySink<GetRegionResponse>,
     ) {
         self.get_region_impl(ctx, req, sink, false)
     }
 
     fn get_prev_region(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         req: GetRegionRequest,
-        sink: ::grpcio::UnarySink<GetRegionResponse>,
+        sink: UnarySink<GetRegionResponse>,
     ) {
         self.get_region_impl(ctx, req, sink, true)
     }
 
     fn get_region_by_id(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         req: GetRegionByIDRequest,
-        sink: ::grpcio::UnarySink<GetRegionResponse>,
+        sink: UnarySink<GetRegionResponse>,
     ) {
-        let resp = check_bootstrap!(ctx, self.cluster, sink, req, GetRegionResponse::default());
+        let resp = check_bootstrap!(ctx, self.cluster, sink, req, GetRegionResponse);
         self.get_region_by_id_impl(ctx, Some(req.get_region_id()), resp, sink)
     }
 
     fn scan_regions(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         mut req: ScanRegionsRequest,
-        sink: ::grpcio::UnarySink<ScanRegionsResponse>,
+        sink: UnarySink<ScanRegionsResponse>,
     ) {
-        let mut resp =
-            check_bootstrap!(ctx, self.cluster, sink, req, ScanRegionsResponse::default());
+        let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, ScanRegionsResponse);
         let range_caches = self.cluster.range_caches().lock().clone();
         let ranges =
             range_caches.range((Excluded(req.take_start_key()), Included(req.take_end_key())));
@@ -499,13 +537,11 @@ impl Pd for PdService {
             for r in regions {
                 let mut s = pdpb::Region::default();
                 s.set_region(r.clone());
-                if let Some(stat) = stats.get(&r.get_id()).cloned() {
-                    if let Some(leader) = stat.leader {
-                        s.set_leader(leader.clone());
-                        resp.mut_leaders().push(leader);
-                    }
-                    s.set_down_peers(stat.down_peer.into());
-                    s.set_pending_peers(stat.pending_peer.into());
+                if let Some(stats) = stats.get(&r.get_id()) {
+                    s.set_leader(stats.leader.clone());
+                    resp.mut_leaders().push(stats.leader.clone());
+                    s.set_down_peers(stats.down_peers.clone().into());
+                    s.set_pending_peers(stats.pending_peers.clone().into());
                 }
                 resp.mut_regions().push(s);
                 resp.mut_region_metas().push(r);
@@ -518,121 +554,201 @@ impl Pd for PdService {
 
     fn ask_split(
         &mut self,
-        ctx: ::grpcio::RpcContext,
-        _req: AskSplitRequest,
-        sink: ::grpcio::UnarySink<AskSplitResponse>,
+        ctx: RpcContext,
+        req: AskSplitRequest,
+        sink: UnarySink<AskSplitResponse>,
     ) {
-        grpcio::unimplemented_call!(ctx, sink)
+        let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, AskSplitResponse);
+        let region = req.get_region();
+        let count = match self.get_split_id_count(region, 1) {
+            Ok(c) => c,
+            Err(e) => {
+                fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e));
+                ctx.spawn(async move {
+                    let _ = sink.success(resp).await;
+                });
+                return;
+            }
+        };
+        let id = self.allocator.id().clone();
+        let f = async move {
+            match id.alloc(count).await {
+                Ok(id) => {
+                    let start_id = id - count + 1;
+                    resp.set_new_region_id(start_id);
+                    let new_peer_ids = resp.mut_new_peer_ids();
+                    for i in start_id + 1..=id {
+                        new_peer_ids.push(i);
+                    }
+                }
+                Err(e) => {
+                    fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e));
+                }
+            }
+            let _ = sink.success(resp).await;
+        };
+        ctx.spawn(f);
     }
+
     fn report_split(
         &mut self,
-        ctx: ::grpcio::RpcContext,
-        _req: ReportSplitRequest,
-        sink: ::grpcio::UnarySink<ReportSplitResponse>,
+        ctx: RpcContext,
+        mut req: ReportSplitRequest,
+        sink: UnarySink<ReportSplitResponse>,
     ) {
-        grpcio::unimplemented_call!(ctx, sink)
+        let resp = check_bootstrap!(ctx, self.cluster, sink, req, ReportSplitResponse);
+        self.cluster
+            .put_regions(vec![req.take_left(), req.take_right()]);
+        ctx.spawn(async move {
+            let _ = sink.success(resp).await;
+        });
     }
+
     fn ask_batch_split(
         &mut self,
-        ctx: ::grpcio::RpcContext,
-        _req: AskBatchSplitRequest,
-        sink: ::grpcio::UnarySink<AskBatchSplitResponse>,
+        ctx: RpcContext,
+        req: AskBatchSplitRequest,
+        sink: UnarySink<AskBatchSplitResponse>,
     ) {
-        grpcio::unimplemented_call!(ctx, sink)
+        let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, AskBatchSplitResponse);
+        let region = req.get_region();
+        let split_count = req.get_split_count() as u64;
+        let count = match self.get_split_id_count(region, split_count) {
+            Ok(c) => c,
+            Err(e) => {
+                fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e));
+                ctx.spawn(async move {
+                    let _ = sink.success(resp).await;
+                });
+                return;
+            }
+        };
+        let id = self.allocator.id().clone();
+        let f = async move {
+            match id.alloc(count).await {
+                Ok(id) => {
+                    let mut start_id = id - count + 1;
+                    let peer_count = count / split_count as u64 - 1;
+                    for _ in 0..split_count {
+                        let mut id = SplitID::default();
+                        id.set_new_region_id(start_id);
+                        let new_peers = id.mut_new_peer_ids();
+                        for i in 1..=peer_count {
+                            new_peers.push(i + start_id);
+                        }
+                        start_id += peer_count + 1;
+                        resp.mut_ids().push(id);
+                    }
+                }
+                Err(e) => {
+                    fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e));
+                }
+            }
+            let _ = sink.success(resp).await;
+        };
+        ctx.spawn(f);
     }
+
     fn report_batch_split(
         &mut self,
-        ctx: ::grpcio::RpcContext,
-        _req: ReportBatchSplitRequest,
-        sink: ::grpcio::UnarySink<ReportBatchSplitResponse>,
+        ctx: RpcContext,
+        mut req: ReportBatchSplitRequest,
+        sink: UnarySink<ReportBatchSplitResponse>,
     ) {
-        grpcio::unimplemented_call!(ctx, sink)
+        let resp = check_bootstrap!(ctx, self.cluster, sink, req, ReportBatchSplitResponse);
+        self.cluster.put_regions(req.take_regions().into());
+        ctx.spawn(async move {
+            let _ = sink.success(resp).await;
+        });
     }
+
     fn get_cluster_config(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         _req: GetClusterConfigRequest,
-        sink: ::grpcio::UnarySink<GetClusterConfigResponse>,
+        sink: UnarySink<GetClusterConfigResponse>,
     ) {
         grpcio::unimplemented_call!(ctx, sink)
     }
     fn put_cluster_config(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         _req: PutClusterConfigRequest,
-        sink: ::grpcio::UnarySink<PutClusterConfigResponse>,
+        sink: UnarySink<PutClusterConfigResponse>,
     ) {
         grpcio::unimplemented_call!(ctx, sink)
     }
     fn scatter_region(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         _req: ScatterRegionRequest,
-        sink: ::grpcio::UnarySink<ScatterRegionResponse>,
+        sink: UnarySink<ScatterRegionResponse>,
     ) {
         grpcio::unimplemented_call!(ctx, sink)
     }
     fn get_gc_safe_point(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         _req: GetGCSafePointRequest,
-        sink: ::grpcio::UnarySink<GetGCSafePointResponse>,
+        sink: UnarySink<GetGCSafePointResponse>,
     ) {
         grpcio::unimplemented_call!(ctx, sink)
     }
     fn update_gc_safe_point(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         _req: UpdateGCSafePointRequest,
-        sink: ::grpcio::UnarySink<UpdateGCSafePointResponse>,
+        sink: UnarySink<UpdateGCSafePointResponse>,
     ) {
         grpcio::unimplemented_call!(ctx, sink)
     }
     fn update_service_gc_safe_point(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         _req: UpdateServiceGCSafePointRequest,
-        sink: ::grpcio::UnarySink<UpdateServiceGCSafePointResponse>,
+        sink: UnarySink<UpdateServiceGCSafePointResponse>,
     ) {
         grpcio::unimplemented_call!(ctx, sink)
     }
     fn sync_regions(
         &mut self,
-        ctx: ::grpcio::RpcContext,
-        _stream: ::grpcio::RequestStream<SyncRegionRequest>,
-        sink: ::grpcio::DuplexSink<SyncRegionResponse>,
+        ctx: RpcContext,
+        _stream: RequestStream<SyncRegionRequest>,
+        sink: DuplexSink<SyncRegionResponse>,
     ) {
         grpcio::unimplemented_call!(ctx, sink)
     }
     fn get_operator(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         _req: GetOperatorRequest,
-        sink: ::grpcio::UnarySink<GetOperatorResponse>,
+        sink: UnarySink<GetOperatorResponse>,
     ) {
         grpcio::unimplemented_call!(ctx, sink)
     }
     fn sync_max_ts(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         _req: SyncMaxTSRequest,
-        sink: ::grpcio::UnarySink<SyncMaxTSResponse>,
+        sink: UnarySink<SyncMaxTSResponse>,
     ) {
         grpcio::unimplemented_call!(ctx, sink)
     }
+
     fn split_regions(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         _req: SplitRegionsRequest,
-        sink: ::grpcio::UnarySink<SplitRegionsResponse>,
+        sink: UnarySink<SplitRegionsResponse>,
     ) {
         grpcio::unimplemented_call!(ctx, sink)
     }
+
     fn get_dc_location_info(
         &mut self,
-        ctx: ::grpcio::RpcContext,
+        ctx: RpcContext,
         _req: GetDCLocationInfoRequest,
-        sink: ::grpcio::UnarySink<GetDCLocationInfoResponse>,
+        sink: UnarySink<GetDCLocationInfoResponse>,
     ) {
         grpcio::unimplemented_call!(ctx, sink)
     }

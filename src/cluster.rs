@@ -1,4 +1,5 @@
 mod cluster;
+pub mod events;
 pub mod stats;
 
 pub use cluster::{
